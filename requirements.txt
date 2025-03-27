@@ -1,0 +1,15 @@
+txt
+numpy
+requests
+psutil
+tqdm
+qdrant-client
+mlx
+mlx-embedding-models
+transformers
+torch
+fastembed
+meilisearch
+elasticsearch
+lancedb
+pyarrow

@@ -50,6 +50,57 @@ CHUNK_SIZE = 512  # Max tokens per chunk
 CHUNK_OVERLAP = 50  # Overlap between chunks
 VECTOR_SIZE = 384  # Default vector size for the model
 
+# Define a comprehensive mapping of model IDs to their corresponding tokenizer IDs
+
+MODEL_TOKENIZER_MAP = {
+    # Traditional models
+    "cstr/paraphrase-multilingual-MiniLM-L12-v2-mlx": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    
+    # MLX models - Dense
+    "bge-small": "BAAI/bge-small-en-v1.5",
+    "bge-base": "BAAI/bge-base-en-v1.5",
+    "bge-large": "BAAI/bge-large-en-v1.5",
+    "bge-m3": "BAAI/bge-m3",
+    "bge-micro": "TaylorAI/bge-micro-v2",
+    
+    "minilm-l6": "sentence-transformers/all-MiniLM-L6-v2",
+    "minilm-l12": "sentence-transformers/all-MiniLM-L12-v2",
+    
+    "multilingual-e5-small": "intfloat/multilingual-e5-small",
+    "multilingual-e5-base": "intfloat/multilingual-e5-base",
+    "multilingual-e5-large": "intfloat/multilingual-e5-large",
+    
+    "gte-tiny": "TaylorAI/gte-tiny",
+    "gte-small": "thenlper/gte-small",
+    "gte-base": "thenlper/gte-base",
+    "gte-large": "thenlper/gte-large",
+    
+    "snowflake-xs": "Snowflake/snowflake-arctic-embed-xs",
+    "snowflake-lg": "Snowflake/snowflake-arctic-embed-l",
+    
+    "nomic-text-v1": "nomic-ai/nomic-embed-text-v1",
+    "nomic-text-v1.5": "nomic-ai/nomic-embed-text-v1.5",
+    
+    "mixedbread-large": "mixedbread-ai/mxbai-embed-large-v1",
+    
+    # MLX models - Sparse
+    "distilbert-splade": "raphaelsty/distilbert-splade",
+    "bert-base-uncased": "bert-base-uncased",
+    "neuralcherche-sparse-embed": "raphaelsty/neural-cherche-sparse-embed",
+    "opensearch": "opensearch-project/opensearch-neural-sparse-encoding-doc-v1",
+    "naver-splade-distilbert": "naver/splade-v3-distilbert",
+    
+    # Ollama models
+    "nomic-embed-text": "nomic-ai/nomic-embed-text-v1",
+    "llama2": "meta-llama/Llama-2-7b-hf",
+    "mistral": "mistralai/Mistral-7B-v0.1",
+    
+    # FastEmbed models
+    "BAAI/bge-small-en-v1.5": "BAAI/bge-small-en-v1.5",
+    "Qdrant/flag-embedding": "Qdrant/flag-embedding",
+    "sentence-transformers/all-MiniLM-L6-v2": "sentence-transformers/all-MiniLM-L6-v2"
+}
+
 # Try to import optional dependencies (moved from main file)
 try:
     import tqdm
@@ -98,13 +149,51 @@ except ImportError:
     qdrant_available = False
     print("Qdrant client not available. Install with: pip install qdrant-client")
 
+
+def get_tokenizer_name(model_name):
+    """
+    Get the appropriate tokenizer name for a given model.
+    
+    Args:
+        model_name: Name of the model to get tokenizer for
+        
+    Returns:
+        Name of the tokenizer to use
+    """
+    # Check if we have a specific mapping
+    if model_name in MODEL_TOKENIZER_MAP:
+        return MODEL_TOKENIZER_MAP[model_name]
+    
+    # For unmapped models, apply some heuristics
+    
+    # 1. If it's a registry shortname with a slash in the original repo,
+    # it's likely in the registry mapping
+    for registry_key, info in MLX_EMBEDDING_REGISTRY.items():
+        if model_name == registry_key and "repo" in info:
+            return info["repo"]
+    
+    # 2. For custom model IDs, use as is (HuggingFace IDs)
+    if "/" in model_name:
+        return model_name
+    
+    # 3. For known prefix patterns, map to likely namespace
+    if model_name.startswith("bge-"):
+        return f"BAAI/{model_name}"
+    
+    if model_name.startswith("e5-"):
+        return f"intfloat/{model_name}"
+    
+    if model_name.startswith("gte-"):
+        return f"thenlper/{model_name}"
+    
+    # 4. Default: just use the name as is, and let HF figure it out
+    return model_name
+
 #######################################
 # TextProcessor Class
 #######################################
 
 class TextProcessor:
-    """Utilities for text processing and result formatting"""
-
     def __init__(self, 
                 model_name: str, 
                 weights_path: str, 
@@ -140,7 +229,7 @@ class TextProcessor:
             custom_pooling: Custom model pooling strategy
             custom_normalize: Whether to normalize embeddings
             custom_max_length: Maximum sequence length
-            use_mlx_embedding: Whether to use mlx_embedding_models instead of traditional model
+            use_mlx_embedding: Whether to use mlx_embedding_models
             use_ollama: Whether to use Ollama for embeddings
             use_fastembed: Whether to use FastEmbed for embeddings
             ollama_model: Ollama model to use
@@ -158,7 +247,7 @@ class TextProcessor:
         self.pytorch_model = None
         self.mlx_model = None
         self.use_mlx = HAS_MLX
-        self.vector_size = VECTOR_SIZE  # Default, will be updated during load_model
+        self.vector_size = VECTOR_SIZE  # Default, will be updated during model initialization
         
         # Store model identifiers for database vector names (don't sanitize here)
         self.dense_model_id = dense_model
@@ -173,14 +262,15 @@ class TextProcessor:
         self.ollama_embedding_provider = None
         self.fastembed_provider = None
         
-        # Flag to track if we need to load the traditional model
+        # Determine which tokenizer model to use based on the active embedding provider
+        tokenizer_model = model_name  # Default fallback
         need_traditional_model = True
         
-        # Initialize FastEmbed provider if enabled (highest priority)
+        # FastEmbed (highest priority)
         if self.use_fastembed:
             if self.verbose:
                 print(f"Using FastEmbed for embeddings with model: {fastembed_model}")
-                
+            
             self.fastembed_provider = FastEmbedProvider(
                 model_name=fastembed_model,
                 sparse_model_name=fastembed_sparse_model,
@@ -189,48 +279,50 @@ class TextProcessor:
                 verbose=verbose
             )
             
-            # Set vector size from FastEmbed model
+            # Set vector size and tokenizer model
             if self.fastembed_provider is not None:
                 self.vector_size = self.fastembed_provider.ndim
+                tokenizer_model = fastembed_model
                 if verbose:
                     print(f"Using vector size from FastEmbed model: {self.vector_size}")
-                    
+            
             # Update model IDs for database storage
             self.dense_model_id = fastembed_model
             self.sparse_model_id = fastembed_sparse_model
             
-            # Don't need traditional model if using FastEmbed
+            # Don't need traditional model
             need_traditional_model = False
         
-        # Initialize Ollama provider if enabled and FastEmbed not used
+        # Ollama (second priority)
         elif self.use_ollama:
             if self.verbose:
                 print(f"Using Ollama for embeddings with model: {ollama_model}")
-                
+            
             self.ollama_embedding_provider = OllamaEmbeddingProvider(
                 model_name=ollama_model,
                 host=ollama_host,
                 verbose=verbose
             )
             
-            # Set vector size from Ollama model
+            # Set vector size and tokenizer model
             if self.ollama_embedding_provider is not None:
                 self.vector_size = self.ollama_embedding_provider.ndim
+                tokenizer_model = ollama_model
                 if verbose:
                     print(f"Using vector size from Ollama model: {self.vector_size}")
-                    
+            
             # Update model IDs for database storage
             self.dense_model_id = ollama_model
             self.sparse_model_id = "ollama_sparse"
             
-            # Don't need traditional model if using Ollama
+            # Don't need traditional model
             need_traditional_model = False
         
-        # Initialize MLX embedding provider if available and neither FastEmbed nor Ollama used
+        # MLX embedding models (third priority)
         elif self.use_mlx_embedding:
             if self.verbose:
-                print(f"Loading dense embedding model: {dense_model}")
-                
+                print(f"Using MLX embedding models: {dense_model} (dense), {sparse_model} (sparse)")
+            
             self.mlx_embedding_provider = MLXEmbeddingProvider(
                 dense_model_name=dense_model,
                 sparse_model_name=sparse_model,
@@ -243,40 +335,26 @@ class TextProcessor:
                 verbose=verbose
             )
             
-            # Set vector size from embedding model
+            # Set vector size and tokenizer model
             if self.mlx_embedding_provider is not None:
                 self.vector_size = self.mlx_embedding_provider.ndim
+                # For tokenizer, prefer custom_repo_id if provided, otherwise use dense_model
+                tokenizer_model = custom_repo_id or dense_model
                 if verbose:
                     print(f"Using vector size from MLX embedding model: {self.vector_size}")
-                    
-            # Don't need traditional model if using MLX embedding models
+            
+            # Don't need traditional model
             need_traditional_model = False
         
-        # Only load tokenizer and traditional model if needed
+        # Load the appropriate tokenizer based on the active model
+        self.load_tokenizer(tokenizer_model)
+        
+        # Load the traditional model if needed
         if need_traditional_model:
             if self.verbose:
+
                 print(f"Using traditional model: {model_name}")
             self.load_model()
-        else:
-            # We still need a tokenizer for chunking, etc.
-            try:
-                # Try to load just the tokenizer (needed for chunking)
-                if HAS_TRANSFORMERS:
-                    resolved_tokenizer = MODEL_TOKENIZER_MAP.get(self.model_name, self.model_name)
-                    self.tokenizer = AutoTokenizer.from_pretrained(resolved_tokenizer)
-                    if self.verbose:
-                        print(f"Loaded tokenizer from {resolved_tokenizer}")
-            except Exception as e:
-                if self.verbose:
-                    print(f"Warning: Could not load tokenizer: {e}")
-        
-        # Update vector size based on which provider is being used
-        if self.use_fastembed and self.fastembed_provider:
-            self.vector_size = self.fastembed_provider.ndim
-        elif self.use_ollama and self.ollama_embedding_provider:
-            self.vector_size = self.ollama_embedding_provider.ndim
-        elif hasattr(self, 'mlx_embedding_provider') and self.mlx_embedding_provider and hasattr(self.mlx_embedding_provider, 'ndim'):
-            self.vector_size = self.mlx_embedding_provider.ndim
 
     @staticmethod
     def create_preview(self, text, query, context_size=300):
@@ -363,6 +441,105 @@ class TextProcessor:
                 final_preview = pattern.sub(f"**{term}**", final_preview)
         
         return final_preview
+    
+    def _load_fallback_tokenizer(self):
+        """
+        Try to load a fallback tokenizer when the primary one fails.
+        
+        This method attempts multiple common tokenizers in order of reliability.
+        """
+        fallbacks = [
+            "sentence-transformers/all-MiniLM-L6-v2",  # Reliable general tokenizer
+            "bert-base-uncased",                      # Basic BERT tokenizer
+            "distilbert-base-uncased",                # DistilBERT tokenizer
+            "gpt2"                                   # GPT tokenizer as last resort
+        ]
+        
+        for fallback in fallbacks:
+            try:
+                if self.verbose:
+                    print(f"Trying fallback tokenizer: {fallback}")
+                self.tokenizer = AutoTokenizer.from_pretrained(fallback)
+                if self.verbose:
+                    print(f"Successfully loaded fallback tokenizer: {fallback}")
+                return
+            except Exception as fallback_error:
+                if self.verbose:
+                    print(f"Fallback tokenizer {fallback} failed: {fallback_error}")
+        
+        # If all fallbacks failed, warn but continue
+        if self.verbose:
+            print("Warning: Could not load any tokenizer. Text chunking functionality may be limited.")
+
+    
+    def load_tokenizer(self, model_name):
+        """
+        Load the appropriate tokenizer for the given model.
+        
+        This method attempts to find the best matching tokenizer for the provided model name,
+        using a mapping for known models and intelligent fallbacks for unknown models.
+        
+        Args:
+            model_name: Name of the model to load tokenizer for
+        """
+        if not HAS_TRANSFORMERS:
+            if self.verbose:
+                print("Transformers not available, skipping tokenizer loading")
+            return
+        
+        try:
+            # First check if we have a specific mapping for this model
+            if model_name in MODEL_TOKENIZER_MAP:
+                tokenizer_name = MODEL_TOKENIZER_MAP[model_name]
+                if self.verbose:
+                    print(f"Using mapped tokenizer: {tokenizer_name}")
+            else:
+                # For MLX registry models, check if we have repo info
+                for registry_key, info in MLX_EMBEDDING_REGISTRY.items():
+                    if model_name == registry_key and "repo" in info:
+                        tokenizer_name = info["repo"]
+                        if self.verbose:
+                            print(f"Using tokenizer from registry repo: {tokenizer_name}")
+                        break
+                else:
+                    # If not in registry, use the model name directly
+                    tokenizer_name = model_name
+                    if self.verbose:
+                        print(f"Using direct tokenizer name: {tokenizer_name}")
+            
+            # Attempt to load the tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+            if self.verbose:
+                print(f"Successfully loaded tokenizer from {tokenizer_name}")
+        
+        except Exception as e:
+            if self.verbose:
+                print(f"Error loading tokenizer for {model_name}: {e}")
+                print("Trying fallback options...")
+            
+            # Try a series of fallbacks
+            fallbacks = [
+                "sentence-transformers/all-MiniLM-L6-v2",  # Reliable general tokenizer
+                "bert-base-uncased",                      # Basic BERT tokenizer
+                "distilbert-base-uncased",                # DistilBERT tokenizer
+                "gpt2"                                   # GPT tokenizer as last resort
+            ]
+            
+            for fallback in fallbacks:
+                try:
+                    if self.verbose:
+                        print(f"Trying fallback tokenizer: {fallback}")
+                    self.tokenizer = AutoTokenizer.from_pretrained(fallback)
+                    if self.verbose:
+                        print(f"Successfully loaded fallback tokenizer: {fallback}")
+                    break
+                except Exception as fallback_error:
+                    if self.verbose:
+                        print(f"Fallback tokenizer failed: {fallback_error}")
+            
+            # If all fallbacks failed, warn but continue
+            if self.tokenizer is None and self.verbose:
+                print("Warning: Could not load any tokenizer. Text chunking functionality may be limited.")
     
     @staticmethod
     def create_smart_preview(text, query, context_size=300):
@@ -617,7 +794,7 @@ class TextProcessor:
             "results": formatted_results
         }
         
-    def load_model(self) -> None:
+    def load_model(self):
         """Load the model (PyTorch or MLX based on availability)"""
         try:
             if self.verbose:
@@ -625,13 +802,8 @@ class TextProcessor:
                 
             start_time = time.time()
             
-            # Load tokenizer from HuggingFace
-            resolved_tokenizer = MODEL_TOKENIZER_MAP.get(self.model_name, self.model_name)
-            if not HAS_TRANSFORMERS:
-                raise ImportError("transformers package is required. Install with: pip install transformers")
+            # Tokenizer is already loaded in __init__, so no need to load again
             
-            self.tokenizer = AutoTokenizer.from_pretrained(resolved_tokenizer)
-
             if self.use_mlx:
                 # Load MLX model
                 if self.verbose:
@@ -648,7 +820,7 @@ class TextProcessor:
                 self.pytorch_model = AutoModel.from_pretrained(self.model_name)
                 config = AutoConfig.from_pretrained(self.model_name)
                 self.vector_size = config.hidden_size
-            
+                
             if self.verbose:
                 print(f"Model loaded in {time.time() - start_time:.2f} seconds")
                 print(f"Model embedding size: {self.vector_size}")
@@ -693,6 +865,7 @@ class TextProcessor:
             print(f"[PyTorch] Error during PyTorch embedding: {e}")
             return np.zeros(self.vector_size, dtype=np.float32)
         
+        
     def get_embedding_mlx(self, text: str) -> np.ndarray:
         """Get embedding for a text using the MLX backend"""
         if not text.strip():
@@ -724,6 +897,7 @@ class TextProcessor:
         except Exception as e:
             print(f"[MLX] Error during MLX embedding: {e}")
             return np.zeros(self.vector_size, dtype=np.float32)
+
             
     def get_embedding(self, text: str) -> np.ndarray:
         """Get embedding for a single text input using preferred backend"""
@@ -756,7 +930,7 @@ class TextProcessor:
             except Exception as e:
                 if self.verbose:
                     print(f"Error using MLX embedding model: {e}")
-                    print("Falling back to original embedding method")
+                    print("Falling back to traditional embedding method")
 
         # Use MLX if available
         if self.use_mlx and self.mlx_model is not None:
@@ -766,7 +940,7 @@ class TextProcessor:
         if self.pytorch_model is not None:
             return self.get_embedding_pytorch(text)
 
-        raise RuntimeError("No valid model backend available (Ollama, MLX, or PyTorch).")
+        raise RuntimeError("No valid model backend available (FastEmbed, Ollama, MLX, or PyTorch).")
 
         
     def process_file(self, file_path: str) -> List[Tuple[np.ndarray, Dict[str, Any]]]:
