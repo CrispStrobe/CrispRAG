@@ -84,10 +84,6 @@ class DBFactory:
         Args:
             db_type: Type of database to create ("qdrant", "lancedb", "meilisearch", "elasticsearch")
             **kwargs: Additional arguments for database initialization
-                - collection_name: Name of the collection to use
-                - vector_size: Size of embedding vectors
-                - storage_path: Path for local storage (if applicable)
-                - And any database-specific parameters
                 
         Returns:
             Instance of the appropriate VectorDBInterface implementation
@@ -126,15 +122,32 @@ class DBFactory:
         dependencies = db_info["dependencies"]
         
         try:
-            # Dynamically import the module
-            module = __import__(module_name)
-            
-            # Get the class from the module
-            db_class = getattr(module, class_name)
-            
-            # Create and return an instance
-            return db_class(**kwargs)
-            
+            # Import specific database module based on type
+            if db_type == "qdrant":
+                from qdrant_db import QdrantManager
+                return QdrantManager(**kwargs)
+            elif db_type == "lancedb":
+                try:
+                    from lancedb_manager import LanceDBManager
+                    return LanceDBManager(**kwargs)
+                except ImportError:
+                    raise ValueError("LanceDB support not available. Install with: pip install lancedb pyarrow")
+            elif db_type == "meilisearch":
+                try:
+                    from meilisearch_manager import MeilisearchManager
+                    return MeilisearchManager(**kwargs)
+                except ImportError:
+                    raise ValueError("Meilisearch support not available. Install with: pip install meilisearch")
+            elif db_type == "elasticsearch":
+                try:
+                    from elasticsearch_manager import ElasticsearchManager
+                    return ElasticsearchManager(**kwargs)
+                except ImportError:
+                    raise ValueError("Elasticsearch support not available. Install with: pip install elasticsearch")
+            else:
+                # This should never happen due to the earlier check, but just in case
+                raise ValueError(f"Unsupported database type: {db_type}")
+                
         except ImportError as e:
             # Provide helpful information about missing dependencies
             deps_str = ", ".join(dependencies)
@@ -152,7 +165,7 @@ class DBFactory:
         except Exception as e:
             # Handle any other initialization errors with context
             error_msg = f"Error initializing {db_type} database: {str(e)}"
-            raise ValueError(error_msg) from e    
+            raise ValueError(error_msg) from e
     
     @staticmethod
     def create_db_old(db_type: str, **kwargs) -> 'VectorDBInterface':

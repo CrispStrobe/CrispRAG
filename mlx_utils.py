@@ -1,4 +1,5 @@
 """
+mlx_utils.py:
 MLX model implementations and utilities for vector search.
 
 This module provides:
@@ -32,8 +33,14 @@ except ImportError:
     HAS_MLX_EMBEDDING_MODELS = False
     print("Warning: mlx_embedding_models not available. Install with: pip install mlx-embedding-models")
 
+try:
+    from utils import EmbeddingUtils
+except ImportError:
+    print("import of generate_sparse_vector failed.")
+
 # MLX Embedding Models Registry
 MLX_EMBEDDING_REGISTRY = {
+    
     # 3 layers, 384-dim
     "bge-micro": {
         "repo": "TaylorAI/bge-micro-v2",
@@ -42,6 +49,15 @@ MLX_EMBEDDING_REGISTRY = {
         "normalize": True, 
         "ndim": 384,
     },
+
+    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2": {
+        "repo": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "max_length": 512,
+        "pooling_strategy": "mean",
+        "normalize": True,
+        "ndim": 384,
+    },
+
     # 6 layers, 384-dim
     "gte-tiny": {
         "repo": "TaylorAI/gte-tiny",
@@ -185,6 +201,14 @@ MLX_EMBEDDING_REGISTRY = {
         "pooling_strategy": "mean",
         "normalize": True,
         "ndim": 384,
+    },
+    # Add direct access to sentence-transformers models
+    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2": {
+        "repo": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "max_length": 512,
+        "pooling_strategy": "mean",
+        "normalize": True,
+        "ndim": 384,
     }
 }
 
@@ -295,16 +319,29 @@ class MLXEmbeddingProvider:
     def __init__(self, 
                 dense_model_name: str = DEFAULT_DENSE_MODEL, 
                 sparse_model_name: str = DEFAULT_SPARSE_MODEL,
+                top_k: int = 64,
+                use_legacy_method=False,
                 custom_repo_id: str = None,
                 custom_ndim: int = None,
                 custom_pooling: str = "mean",
                 custom_normalize: bool = True,
                 custom_max_length: int = 512,
-                top_k: int = 64,
                 batch_size: int = 16,
                 verbose: bool = False):
         """
         Initialize MLXEmbeddingProvider with specified dense and sparse models.
+        
+        Args:
+            dense_model_name: MLX embedding model name for dense vectors
+            sparse_model_name: MLX embedding model name for sparse vectors
+            custom_repo_id: Custom model repo ID (overrides dense_model_name if provided)
+            custom_ndim: Custom model embedding dimension
+            custom_pooling: Custom model pooling strategy
+            custom_normalize: Whether to normalize embeddings
+            custom_max_length: Maximum sequence length
+            top_k: Top-k tokens to keep in sparse vectors
+            batch_size: Batch size for encoding
+            verbose: Whether to show verbose output
         """
         # Initialize basic properties
         self.verbose = verbose
@@ -320,11 +357,31 @@ class MLXEmbeddingProvider:
         self.batch_size = batch_size
         self.top_k = top_k
         
+        # If a custom repo id is provided, use it as the actual model name for database storage
+        self.effective_dense_model_name = custom_repo_id if custom_repo_id else dense_model_name
+        
+        # Debug output for identifying the actual model name
+        if verbose:
+            print(f"MLXEmbeddingProvider initialization:")
+            if custom_repo_id:
+                print(f"  Using custom repo ID: {custom_repo_id}")
+            else:
+                print(f"  Using default dense model: {dense_model_name}")
+            print(f"  Effective model name: {self.effective_dense_model_name}")
+        
         # Use default dimension from registry, can be overridden for custom models
-        if dense_model_name in MLX_EMBEDDING_REGISTRY:
+        if self.effective_dense_model_name in MLX_EMBEDDING_REGISTRY:
+            self.ndim = MLX_EMBEDDING_REGISTRY[self.effective_dense_model_name]["ndim"]
+            if verbose:
+                print(f"  Found dimension {self.ndim} for {self.effective_dense_model_name} in registry")
+        elif dense_model_name in MLX_EMBEDDING_REGISTRY:
             self.ndim = MLX_EMBEDDING_REGISTRY[dense_model_name]["ndim"]
+            if verbose:
+                print(f"  Found dimension {self.ndim} for {dense_model_name} in registry (fallback)")
         else:
             self.ndim = custom_ndim or 384  # Default if not specified
+            if verbose:
+                print(f"  Using default or custom dimension: {self.ndim}")
         
         # Skip model loading if mlx_embedding_models not available
         if not HAS_MLX_EMBEDDING_MODELS:
@@ -333,62 +390,184 @@ class MLXEmbeddingProvider:
             return
         
         try:
+            # Detect available parameters in the EmbeddingModel class
+            # This allows us to adapt to different versions of mlx_embedding_models
+            from mlx_embedding_models import EmbeddingModel
+            import inspect
+            
+            # Get parameters for from_pretrained method
+            pretrained_params = set(inspect.signature(EmbeddingModel.from_pretrained).parameters.keys())
+            
+            # Check if from_registry method exists
+            has_registry_method = hasattr(EmbeddingModel, 'from_registry')
+            
+            if verbose:
+                print(f"  Available parameters for from_pretrained: {', '.join(pretrained_params)}")
+                print(f"  from_registry method available: {has_registry_method}")
+            
+            # Map our parameters to what's available
+            # Check for the correct pooling parameter name
+            pooling_param_name = None
+            if 'pooling_strategy' in pretrained_params:
+                pooling_param_name = 'pooling_strategy'
+            elif 'pooling' in pretrained_params:
+                pooling_param_name = 'pooling'
+                
+            if verbose and pooling_param_name:
+                print(f"  Using pooling parameter name: {pooling_param_name}")
+            
             # Load dense model
             if verbose:
-                print(f"Loading dense embedding model: {dense_model_name}")
+                print(f"Loading dense embedding model: {self.effective_dense_model_name}")
             
-            # Handle custom model if specified
-            if custom_repo_id:
+            # First try direct loading from registry if the method and model exist
+            if has_registry_method and self.effective_dense_model_name in MLX_EMBEDDING_REGISTRY:
+                try:
+                    if verbose:
+                        print(f"  Attempting to load from registry directly: {self.effective_dense_model_name}")
+                    self.dense_model = EmbeddingModel.from_registry(self.effective_dense_model_name)
+                    if verbose:
+                        print(f"  Successfully loaded model from registry")
+                except Exception as e:
+                    if verbose:
+                        print(f"  Failed to load from registry: {e}")
+                    self.dense_model = None
+            
+            # If registry loading failed or wasn't possible, try from_pretrained
+            if self.dense_model is None:
+                # Determine which repo ID to use
+                repo_id = custom_repo_id
+                if not repo_id and self.effective_dense_model_name in MLX_EMBEDDING_REGISTRY:
+                    repo_id = MLX_EMBEDDING_REGISTRY[self.effective_dense_model_name].get("repo")
+                
+                if not repo_id:
+                    repo_id = self.effective_dense_model_name
+                
                 if verbose:
-                    print(f"Using custom model repo: {custom_repo_id}")
-                # Create model with custom parameters
+                    print(f"  Attempting to load with from_pretrained: {repo_id}")
+                
+                # Build kwargs with only supported parameters
+                kwargs = {"model_name_or_path": repo_id}
+                
+                if pooling_param_name and custom_pooling:
+                    kwargs[pooling_param_name] = custom_pooling
+                
+                if 'normalize' in pretrained_params:
+                    kwargs['normalize'] = custom_normalize
+                
+                if 'max_length' in pretrained_params:
+                    kwargs['max_length'] = custom_max_length
+                
+                if custom_ndim and 'ndim' in pretrained_params:
+                    kwargs['ndim'] = custom_ndim
+                
+                # Try to load with appropriate parameters
+                if verbose:
+                    print(f"  Loading with parameters: {kwargs}")
+                
                 try:
-                    self.dense_model = EmbeddingModel.from_pretrained(
-                        custom_repo_id,
-                        pooling_strategy=custom_pooling,
-                        normalize=custom_normalize,
-                        max_length=custom_max_length
-                    )
-                    if custom_ndim:
-                        self.ndim = custom_ndim
-                    else:
-                        # Try to get dimension from model config, safely
-                        try:
-                            if hasattr(self.dense_model.model, 'config') and hasattr(self.dense_model.model.config, 'hidden_size'):
-                                self.ndim = self.dense_model.model.config.hidden_size
-                        except Exception as e:
-                            if verbose:
-                                print(f"Could not determine dimension from model: {e}")
-                                print(f"Using default dimension: {self.ndim}")
+                    self.dense_model = EmbeddingModel.from_pretrained(**kwargs)
+                    if verbose:
+                        print(f"  Successfully loaded model with from_pretrained")
                 except Exception as e:
-                    print(f"Error loading custom model {custom_repo_id}: {e}")
-                    self.dense_model = None
-            else:
-                # Load from registry
-                try:
-                    self.dense_model = EmbeddingModel.from_registry(dense_model_name)
-                    # Safely get dimension from model
-                    if hasattr(self.dense_model.model, 'config') and hasattr(self.dense_model.model.config, 'hidden_size'):
-                        self.ndim = self.dense_model.model.config.hidden_size
-                except Exception as e:
-                    print(f"Error loading model {dense_model_name} from registry: {e}")
-                    self.dense_model = None
+                    print(f"  Error loading model with from_pretrained: {e}")
                     
-            if self.dense_model and verbose:
-                print(f"Loaded dense model with dimension: {self.ndim}")
+                    # Last resort: try the default BGE-small model
+                    if self.effective_dense_model_name != "bge-small" and has_registry_method:
+                        try:
+                            if verbose:
+                                print(f"  Attempting to fall back to default bge-small model")
+                            self.dense_model = EmbeddingModel.from_registry("bge-small")
+                            if verbose:
+                                print(f"  Successfully loaded fallback model")
+                        except Exception as e2:
+                            print(f"  Failed to load fallback model: {e2}")
+                            raise ValueError(f"Could not load any embedding model. Original error: {e}, Fallback error: {e2}")
+                    else:
+                        raise
             
-            # Load sparse model
+            # If model is loaded, try to extract dimension and other properties
+            if self.dense_model is not None:
+                # Extract dimension from model if possible
+                if hasattr(self.dense_model, 'ndim'):
+                    self.ndim = self.dense_model.ndim
+                    if verbose:
+                        print(f"  Using model's ndim attribute: {self.ndim}")
+                elif hasattr(self.dense_model.model, 'config') and hasattr(self.dense_model.model.config, 'hidden_size'):
+                    self.ndim = self.dense_model.model.config.hidden_size
+                    if verbose:
+                        print(f"  Extracted dimension from model config: {self.ndim}")
+                
+                # Extract normalization property if available
+                if hasattr(self.dense_model, 'normalize'):
+                    self.normalize = self.dense_model.normalize
+                else:
+                    self.normalize = custom_normalize
+                
+                if verbose:
+                    print(f"  Dense model loaded with dimension: {self.ndim}, normalize: {self.normalize}")
+            else:
+                print(f"  WARNING: Dense model initialization failed!")
+                raise ValueError("Could not initialize dense embedding model")
+            
+            # Load sparse model (only if dense model was successful)
             if verbose:
                 print(f"Loading sparse embedding model: {sparse_model_name}")
+            
             try:
-                self.sparse_model = SpladeModel.from_registry(sparse_model_name, top_k=top_k)
-                if verbose:
-                    print(f"Loaded SPLADE model with top-k: {top_k}")
+                # Check if SpladeModel exists
+                if "SpladeModel" in globals():
+                    self.sparse_model = SpladeModel.from_registry(sparse_model_name, top_k=top_k)
+                    if verbose:
+                        print(f"  Loaded SPLADE model with top-k: {top_k}")
+                # Check if sparse model is a registry entry with lm_head flag
+                elif sparse_model_name in MLX_EMBEDDING_REGISTRY and MLX_EMBEDDING_REGISTRY[sparse_model_name].get("lm_head", False):
+                    # Try the direct from_registry method first
+                    try:
+                        self.sparse_model = EmbeddingModel.from_registry(sparse_model_name)
+                        if verbose:
+                            print(f"  Loaded sparse model from registry")
+                    except Exception as e:
+                        if verbose:
+                            print(f"  Error loading sparse model from registry: {e}")
+                        
+                        # Try from_pretrained as fallback
+                        repo_id = MLX_EMBEDDING_REGISTRY[sparse_model_name].get("repo", sparse_model_name)
+                        
+                        sparse_kwargs = {"model_name_or_path": repo_id}
+                        if 'normalize' in pretrained_params:
+                            sparse_kwargs['normalize'] = False  # Usually sparse models aren't normalized
+                        
+                        if pooling_param_name:
+                            sparse_kwargs[pooling_param_name] = "mean"  # Default pooling for sparse models
+                        
+                        try:
+                            self.sparse_model = EmbeddingModel.from_pretrained(**sparse_kwargs)
+                            if verbose:
+                                print(f"  Loaded sparse model with from_pretrained")
+                        except Exception as e2:
+                            print(f"  Error loading sparse model with from_pretrained: {e2}")
+                            self.sparse_model = None
+                else:
+                    # Fall back to using the dense model for sparse encoding
+                    self.sparse_model = self.dense_model
+                    if verbose:
+                        print(f"  Using dense model for sparse encoding (no dedicated sparse model available)")
             except Exception as e:
-                print(f"Error loading SPLADE model: {e}")
-                self.sparse_model = None
+                print(f"  Error loading sparse model: {e}")
+                # Fall back to using the dense model
+                self.sparse_model = self.dense_model
+                if verbose:
+                    print(f"  Falling back to dense model for sparse encoding")
+            
+            if self.dense_model and verbose:
+                print(f"MLXEmbeddingProvider initialized successfully")
+        
         except Exception as e:
-            print(f"Error loading MLX embedding models: {e}")
+            print(f"Error initializing MLX embedding provider: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
     
     def rerank_with_mlx(self, query: str, passages: List[str], top_k: int = None) -> List[float]:
         """
@@ -408,7 +587,7 @@ class MLXEmbeddingProvider:
         # But should share common code with SearchAlgorithms.rerank_results
         
         # If you're moving the implementation to SearchAlgorithms.rerank_results:
-        from .utils import SearchAlgorithms
+        from utils import SearchAlgorithms
         
         # Create a simple processor-like object that provides get_embedding
         class SimpleProcessor:
@@ -757,7 +936,6 @@ class MLXEmbeddingProvider:
             
             # Run the model manually
             mlm_output, _ = self.sparse_model.model(**batch)
-            
             # Apply max pooling over sequence length dimension (dim=1)
             # Multiply by attention mask to ignore padding
             embs = mx.max(mlm_output * mx.expand_dims(batch["attention_mask"], -1), axis=1)
@@ -893,9 +1071,10 @@ class MLXEmbeddingProvider:
                 if self.verbose:
                     print(f"Error processing text in batch: {e}")
                 # Always return something, even if processing fails
-                results.append(EmbeddingUtils.generate_sparse_vector(text))
+                results.append(([0], [0.0]))  # Simple fallback
         
         return results
+
 
 class MLXModel:
     """Wrapper for MLX model operations using custom BertModel"""

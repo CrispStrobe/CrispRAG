@@ -1,13 +1,19 @@
 """
+utils.py:
+
 Consolidated utilities for all functionality.
 
 This module contains all shared functionality including:
 - Text processing and result formatting
 - Search algorithms
-- Embedding utilities
 - File processing
 - Model utilities
 - General utilities
+
+Design principles:
+1. Avoids circular imports through provider-agnostic base implementations
+2. Uses lazy imports for provider-specific functionality
+3. Maintains clear separation of concerns between components
 """
 
 import re
@@ -22,36 +28,18 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional, Set, Iterator, Union, Literal
 import numpy as np
 
-from mlx_utils import (
-    MLXEmbeddingProvider, MLXModel, generate_sparse_vector as mlx_generate_sparse_vector,
-    DEFAULT_DENSE_MODEL, DEFAULT_SPARSE_MODEL, HAS_MLX_EMBEDDING_MODELS
-)
-from ollama_utils import (
-    OllamaEmbeddingProvider, generate_sparse_vector as ollama_generate_sparse_vector,
-    HAS_OLLAMA, DEFAULT_OLLAMA_EMBED_MODEL
-)
-from fastembed_utils import (
-    FastEmbedProvider, generate_sparse_vector as fastembed_generate_sparse_vector,
-    HAS_FASTEMBED, DEFAULT_FASTEMBED_MODEL, DEFAULT_FASTEMBED_SPARSE_MODEL
-)
-
-# Constants (moved from main file)
+# Constants
 DEFAULT_COLLECTION = "documents"
 DEFAULT_MODEL = "cstr/paraphrase-multilingual-MiniLM-L12-v2-mlx"
 DEFAULT_WEIGHTS_PATH = "weights/paraphrase-multilingual-MiniLM-L12-v2.npz"
 DEFAULT_WEIGHTS_URL = "https://huggingface.co/cstr/paraphrase-multilingual-MiniLM-L12-v2-mlx/resolve/main/paraphrase-multilingual-MiniLM-L12-v2.npz"
 DEFAULT_CONFIG_URL = "https://huggingface.co/cstr/paraphrase-multilingual-MiniLM-L12-v2-mlx/resolve/main/config.json"
-MODEL_TOKENIZER_MAP = {
-    "cstr/paraphrase-multilingual-MiniLM-L12-v2-mlx": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-}
-
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".html", ".pdf", ".json", ".csv"}
 CHUNK_SIZE = 512  # Max tokens per chunk
 CHUNK_OVERLAP = 50  # Overlap between chunks
 VECTOR_SIZE = 384  # Default vector size for the model
 
-# Define a comprehensive mapping of model IDs to their corresponding tokenizer IDs
-
+# Comprehensive mapping of model IDs to their corresponding tokenizer IDs
 MODEL_TOKENIZER_MAP = {
     # Traditional models
     "cstr/paraphrase-multilingual-MiniLM-L12-v2-mlx": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
@@ -101,7 +89,7 @@ MODEL_TOKENIZER_MAP = {
     "sentence-transformers/all-MiniLM-L6-v2": "sentence-transformers/all-MiniLM-L6-v2"
 }
 
-# Try to import optional dependencies (moved from main file)
+# Try to import optional dependencies
 try:
     import tqdm
     from tqdm import tqdm
@@ -126,19 +114,52 @@ except ImportError:
     print("Warning: transformers not available. Install with: pip install transformers")
 
 try:
-    from mlx_embedding_models.embedding import EmbeddingModel, SpladeModel
-    HAS_MLX_EMBEDDING_MODELS = True
-except ImportError:
-    HAS_MLX_EMBEDDING_MODELS = False
-    print("Warning: mlx_embedding_models not available. Install with: pip install mlx-embedding-models")
-
-try:
     import torch
     HAS_PYTORCH = True
 except ImportError:
     HAS_PYTORCH = False
     if not HAS_MLX:
         print("Warning: Neither MLX nor PyTorch is available. At least one is required for embedding generation.")
+
+# Lazy imports for provider modules to avoid circular dependencies
+def _import_mlx_embedding_models():
+    """Safely import mlx_embedding_models if available"""
+    try:
+        from mlx_embedding_models.embedding import EmbeddingModel, SpladeModel
+        HAS_MLX_EMBEDDING_MODELS = True
+        return EmbeddingModel, SpladeModel, HAS_MLX_EMBEDDING_MODELS
+    except ImportError:
+        HAS_MLX_EMBEDDING_MODELS = False
+        if HAS_MLX:
+            print("Warning: mlx_embedding_models not available. Install with: pip install mlx-embedding-models")
+        return None, None, False
+
+def _import_mlx_provider():
+    """Safely import MLXEmbeddingProvider"""
+    try:
+        from mlx_utils import MLXEmbeddingProvider, MLXModel, DEFAULT_DENSE_MODEL, DEFAULT_SPARSE_MODEL
+        return MLXEmbeddingProvider, MLXModel, DEFAULT_DENSE_MODEL, DEFAULT_SPARSE_MODEL
+    except ImportError:
+        return None, None, "bge-small", "distilbert-splade"
+
+def _import_ollama_provider():
+    """Safely import OllamaEmbeddingProvider"""
+    try:
+        from ollama_utils import OllamaEmbeddingProvider, HAS_OLLAMA, DEFAULT_OLLAMA_EMBED_MODEL
+        return OllamaEmbeddingProvider, HAS_OLLAMA, DEFAULT_OLLAMA_EMBED_MODEL
+    except ImportError:
+        return None, False, "nomic-embed-text"
+
+def _import_fastembed_provider():
+    """Safely import FastEmbedProvider"""
+    try:
+        from fastembed_utils import FastEmbedProvider, HAS_FASTEMBED, DEFAULT_FASTEMBED_MODEL, DEFAULT_FASTEMBED_SPARSE_MODEL
+        return FastEmbedProvider, HAS_FASTEMBED, DEFAULT_FASTEMBED_MODEL, DEFAULT_FASTEMBED_SPARSE_MODEL
+    except ImportError:
+        return None, False, "BAAI/bge-small-en-v1.5", "prithivida/Splade_PP_en_v1"
+
+# Check for MLX Embedding Models
+_, _, HAS_MLX_EMBEDDING_MODELS = _import_mlx_embedding_models()
 
 # Import Qdrant for availability check
 try:
@@ -165,18 +186,7 @@ def get_tokenizer_name(model_name):
         return MODEL_TOKENIZER_MAP[model_name]
     
     # For unmapped models, apply some heuristics
-    
-    # 1. If it's a registry shortname with a slash in the original repo,
-    # it's likely in the registry mapping
-    for registry_key, info in MLX_EMBEDDING_REGISTRY.items():
-        if model_name == registry_key and "repo" in info:
-            return info["repo"]
-    
-    # 2. For custom model IDs, use as is (HuggingFace IDs)
-    if "/" in model_name:
-        return model_name
-    
-    # 3. For known prefix patterns, map to likely namespace
+    # For known prefix patterns, map to likely namespace
     if model_name.startswith("bge-"):
         return f"BAAI/{model_name}"
     
@@ -186,8 +196,59 @@ def get_tokenizer_name(model_name):
     if model_name.startswith("gte-"):
         return f"thenlper/{model_name}"
     
-    # 4. Default: just use the name as is, and let HF figure it out
+    # Default: just use the name as is, and let HF figure it out
     return model_name
+
+
+#######################################
+# EmbeddingUtils Class
+#######################################
+
+class EmbeddingUtils:
+    """Utilities for generating embeddings and vector operations"""
+    
+    @staticmethod
+    def generate_sparse_vector(text: str) -> Tuple[List[int], List[float]]:
+        """
+        Generate a simple sparse vector using term frequencies.
+        This is a standalone implementation that doesn't depend on providers.
+        
+        Args:
+            text: Text to encode
+                
+        Returns:
+            Tuple of (indices, values) for sparse vector representation
+        """
+        from collections import Counter
+        import re
+        
+        # Simple tokenization
+        tokens = re.findall(r'\b\w+\b', text.lower())
+        
+        # Remove very common words (simple stopwords)
+        stopwords = {'the', 'a', 'an', 'and', 'or', 'but', 'is', 'are', 'of', 'to', 'in', 'that', 'it', 'with', 'for'}
+        tokens = [t for t in tokens if t not in stopwords and len(t) > 1]
+        
+        # Count terms
+        counter = Counter(tokens)
+        
+        # Convert to sparse vector format
+        indices = []
+        values = []
+        
+        for term, count in counter.items():
+            # Simple hash function for terms - use a better one in production
+            # Limit to 100000 dimensions
+            term_index = hash(term) % 100000
+            term_value = count / max(1, len(tokens))  # Normalize by document length, avoid division by zero
+            indices.append(term_index)
+            values.append(term_value)
+        
+        # If empty, return a single default dimension
+        if not indices:
+            return [0], [0.0]
+                
+        return indices, values
 
 #######################################
 # TextProcessor Class
@@ -195,26 +256,26 @@ def get_tokenizer_name(model_name):
 
 class TextProcessor:
     def __init__(self, 
-                model_name: str, 
-                weights_path: str, 
-                dense_model: str = DEFAULT_DENSE_MODEL, 
-                sparse_model: str = DEFAULT_SPARSE_MODEL,
-                top_k: int = 64,
-                custom_repo_id: str = None,
-                custom_ndim: int = None,
-                custom_pooling: str = "mean",
-                custom_normalize: bool = True,
-                custom_max_length: int = 512,
-                use_mlx_embedding: bool = False,
-                use_ollama: bool = False,
-                use_fastembed: bool = False,
-                ollama_model: str = DEFAULT_OLLAMA_EMBED_MODEL,
-                ollama_host: str = "http://localhost:11434",
-                fastembed_model: str = DEFAULT_FASTEMBED_MODEL,
-                fastembed_sparse_model: str = DEFAULT_FASTEMBED_SPARSE_MODEL,
-                fastembed_use_gpu: bool = False,
-                fastembed_cache_dir: str = None,
-                verbose: bool = False):
+                    model_name: str, 
+                    weights_path: str, 
+                    dense_model: str = "bge-small", 
+                    sparse_model: str = "distilbert-splade",
+                    top_k: int = 64,
+                    custom_repo_id: str = None,
+                    custom_ndim: int = None,
+                    custom_pooling: str = "mean",
+                    custom_normalize: bool = True,
+                    custom_max_length: int = 512,
+                    use_mlx_embedding: bool = False,
+                    use_ollama: bool = False,
+                    use_fastembed: bool = False,
+                    ollama_model: str = None,
+                    ollama_host: str = "http://localhost:11434",
+                    fastembed_model: str = None,
+                    fastembed_sparse_model: str = None,
+                    fastembed_use_gpu: bool = False,
+                    fastembed_cache_dir: str = None,
+                    verbose: bool = False):
         """
         Initialize DocumentProcessor with support for MLX, Ollama, or FastEmbed embedding models.
         
@@ -249,14 +310,27 @@ class TextProcessor:
         self.use_mlx = HAS_MLX
         self.vector_size = VECTOR_SIZE  # Default, will be updated during model initialization
         
-        # Store model identifiers for database vector names (don't sanitize here)
-        self.dense_model_id = dense_model
+        # Use custom_repo_id as the dense model ID if provided
+        self.dense_model_id = custom_repo_id if custom_repo_id else dense_model
         self.sparse_model_id = sparse_model
         
+        # Flag to track whether we need traditional model
+        need_traditional_model = True
+        
+        # Load default provider constants if not provided
+        if ollama_model is None:
+            _, _, DEFAULT_OLLAMA_EMBED_MODEL = _import_ollama_provider()
+            ollama_model = DEFAULT_OLLAMA_EMBED_MODEL
+            
+        if fastembed_model is None:
+            _, _, DEFAULT_FASTEMBED_MODEL, DEFAULT_FASTEMBED_SPARSE_MODEL = _import_fastembed_provider()
+            fastembed_model = DEFAULT_FASTEMBED_MODEL
+            fastembed_sparse_model = DEFAULT_FASTEMBED_SPARSE_MODEL
+        
         # Determine which embedding provider to use (priority order)
-        self.use_fastembed = use_fastembed and HAS_FASTEMBED
-        self.use_ollama = use_ollama and HAS_OLLAMA and not self.use_fastembed
-        self.use_mlx_embedding = use_mlx_embedding and HAS_MLX_EMBEDDING_MODELS and not self.use_fastembed and not self.use_ollama
+        self.use_fastembed = use_fastembed
+        self.use_ollama = use_ollama and not self.use_fastembed
+        self.use_mlx_embedding = use_mlx_embedding and not self.use_fastembed and not self.use_ollama
         
         self.mlx_embedding_provider = None
         self.ollama_embedding_provider = None
@@ -264,100 +338,151 @@ class TextProcessor:
         
         # Determine which tokenizer model to use based on the active embedding provider
         tokenizer_model = model_name  # Default fallback
-        need_traditional_model = True
         
         # FastEmbed (highest priority)
         if self.use_fastembed:
-            if self.verbose:
-                print(f"Using FastEmbed for embeddings with model: {fastembed_model}")
+            FastEmbedProvider, HAS_FASTEMBED, DEFAULT_FASTEMBED_MODEL, DEFAULT_FASTEMBED_SPARSE_MODEL = _import_fastembed_provider()
             
-            self.fastembed_provider = FastEmbedProvider(
-                model_name=fastembed_model,
-                sparse_model_name=fastembed_sparse_model,
-                use_gpu=fastembed_use_gpu,
-                cache_dir=fastembed_cache_dir,
-                verbose=verbose
-            )
-            
-            # Set vector size and tokenizer model
-            if self.fastembed_provider is not None:
-                self.vector_size = self.fastembed_provider.ndim
-                tokenizer_model = fastembed_model
-                if verbose:
-                    print(f"Using vector size from FastEmbed model: {self.vector_size}")
-            
-            # Update model IDs for database storage
-            self.dense_model_id = fastembed_model
-            self.sparse_model_id = fastembed_sparse_model
-            
-            # Don't need traditional model
-            need_traditional_model = False
+            if not HAS_FASTEMBED:
+                if self.verbose:
+                    print("Warning: FastEmbed not available. Falling back to next provider.")
+                self.use_fastembed = False
+            else:
+                if self.verbose:
+                    print(f"Using FastEmbed for embeddings with model: {fastembed_model}")
+                
+                self.fastembed_provider = FastEmbedProvider(
+                    model_name=fastembed_model,
+                    sparse_model_name=fastembed_sparse_model,
+                    use_gpu=fastembed_use_gpu,
+                    cache_dir=fastembed_cache_dir,
+                    verbose=verbose
+                )
+                
+                # Set vector size and tokenizer model
+                if self.fastembed_provider is not None:
+                    self.vector_size = self.fastembed_provider.ndim
+                    tokenizer_model = fastembed_model
+                    if verbose:
+                        print(f"Using vector size from FastEmbed model: {self.vector_size}")
+                
+                # Update model IDs for database storage
+                self.dense_model_id = fastembed_model
+                self.sparse_model_id = fastembed_sparse_model
+                
+                # Don't need traditional model
+                need_traditional_model = False
         
         # Ollama (second priority)
-        elif self.use_ollama:
-            if self.verbose:
-                print(f"Using Ollama for embeddings with model: {ollama_model}")
+        if self.use_ollama:
+            OllamaEmbeddingProvider, HAS_OLLAMA, DEFAULT_OLLAMA_EMBED_MODEL = _import_ollama_provider()
             
-            self.ollama_embedding_provider = OllamaEmbeddingProvider(
-                model_name=ollama_model,
-                host=ollama_host,
-                verbose=verbose
-            )
-            
-            # Set vector size and tokenizer model
-            if self.ollama_embedding_provider is not None:
-                self.vector_size = self.ollama_embedding_provider.ndim
-                tokenizer_model = ollama_model
-                if verbose:
-                    print(f"Using vector size from Ollama model: {self.vector_size}")
-            
-            # Update model IDs for database storage
-            self.dense_model_id = ollama_model
-            self.sparse_model_id = "ollama_sparse"
-            
-            # Don't need traditional model
-            need_traditional_model = False
+            if not HAS_OLLAMA:
+                if self.verbose:
+                    print("Warning: Ollama not available. Falling back to next provider.")
+                self.use_ollama = False
+            else:
+                if self.verbose:
+                    print(f"Using Ollama for embeddings with model: {ollama_model}")
+                
+                self.ollama_embedding_provider = OllamaEmbeddingProvider(
+                    model_name=ollama_model,
+                    host=ollama_host,
+                    verbose=verbose
+                )
+                
+                # Set vector size and tokenizer model
+                if self.ollama_embedding_provider is not None:
+                    self.vector_size = self.ollama_embedding_provider.ndim
+                    tokenizer_model = ollama_model
+                    if verbose:
+                        print(f"Using vector size from Ollama model: {self.vector_size}")
+                
+                # Update model IDs for database storage
+                self.dense_model_id = ollama_model
+                self.sparse_model_id = "ollama_sparse"
+                
+                # Don't need traditional model
+                need_traditional_model = False
         
         # MLX embedding models (third priority)
-        elif self.use_mlx_embedding:
-            if self.verbose:
-                print(f"Using MLX embedding models: {dense_model} (dense), {sparse_model} (sparse)")
+        if self.use_mlx_embedding:
+            MLXEmbeddingProvider, MLXModel, DEFAULT_DENSE_MODEL, DEFAULT_SPARSE_MODEL = _import_mlx_provider()
             
-            self.mlx_embedding_provider = MLXEmbeddingProvider(
-                dense_model_name=dense_model,
-                sparse_model_name=sparse_model,
-                custom_repo_id=custom_repo_id,
-                custom_ndim=custom_ndim,
-                custom_pooling=custom_pooling,
-                custom_normalize=custom_normalize,
-                custom_max_length=custom_max_length,
-                top_k=top_k,
-                verbose=verbose
-            )
+            # If a custom repo ID is specified, it should override the dense model
+            effective_dense_model = custom_repo_id if custom_repo_id else dense_model
             
-            # Set vector size and tokenizer model
-            if self.mlx_embedding_provider is not None:
-                self.vector_size = self.mlx_embedding_provider.ndim
-                # For tokenizer, prefer custom_repo_id if provided, otherwise use dense_model
-                tokenizer_model = custom_repo_id or dense_model
-                if verbose:
-                    print(f"Using vector size from MLX embedding model: {self.vector_size}")
-            
-            # Don't need traditional model
-            need_traditional_model = False
+            if not HAS_MLX_EMBEDDING_MODELS or MLXEmbeddingProvider is None:
+                if self.verbose:
+                    print("Warning: MLX embedding models not available. Falling back to traditional model.")
+                self.use_mlx_embedding = False
+            else:
+                if self.verbose:
+                    print(f"Using MLX embedding models:")
+                    if custom_repo_id:
+                        print(f"  - Custom repository: {custom_repo_id}")
+                    else:
+                        print(f"  - Dense model: {dense_model}")
+                    print(f"  - Sparse model: {sparse_model}")
+                
+                # Create MLX embedding provider using the effective model name
+                try:
+                    self.mlx_embedding_provider = MLXEmbeddingProvider(
+                        dense_model_name=effective_dense_model,  # This can be either custom_repo_id or dense_model
+                        sparse_model_name=sparse_model,
+                        top_k=top_k,
+                        custom_repo_id=custom_repo_id,
+                        custom_ndim=custom_ndim,
+                        custom_pooling=custom_pooling,
+                        custom_normalize=custom_normalize,
+                        custom_max_length=custom_max_length,
+                        verbose=verbose
+                    )
+                    self.embedding_model = self.mlx_embedding_provider
+                    self.dense_model_id = custom_repo_id if custom_repo_id else dense_model
+                    self.sparse_model_id = sparse_model
+                    
+                    # Verify that dense model was properly loaded
+                    if hasattr(self.mlx_embedding_provider, 'dense_model') and self.mlx_embedding_provider.dense_model is not None:
+                        if self.verbose:
+                            print(f"Successfully initialized MLX embedding provider with dense model")
+                            
+                        # Set vector size and tokenizer model
+                        self.vector_size = self.mlx_embedding_provider.ndim
+                        
+                        # For tokenizer, always use the effective model
+                        tokenizer_model = effective_dense_model
+                        
+                        if verbose:
+                            print(f"Using vector size from MLX embedding model: {self.vector_size}")
+                        
+                        # Don't need traditional model since MLX embedding provider is working
+                        need_traditional_model = False
+                    else:
+                        if self.verbose:
+                            print(f"MLX embedding provider was created but dense_model wasn't properly loaded")
+                            print(f"Falling back to traditional model")
+                        # We'll need traditional model as a fallback
+                        need_traditional_model = True
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Failed to initialize MLX embedding provider: {e}")
+                        print("Falling back to traditional model")
+                    need_traditional_model = True
         
         # Load the appropriate tokenizer based on the active model
         self.load_tokenizer(tokenizer_model)
         
-        # Load the traditional model if needed
+        # Load the traditional model if needed - ONLY if explicitly needed
         if need_traditional_model:
             if self.verbose:
-
-                print(f"Using traditional model: {model_name}")
+                print(f"Loading traditional model: {model_name}")
             self.load_model()
+        elif self.verbose:
+            print(f"Skipping traditional model load - using embedding provider directly")
 
     @staticmethod
-    def create_preview(self, text, query, context_size=300):
+    def create_preview(text, query, context_size=300):
         """
         Create a preview with context around search terms.
         
@@ -470,7 +595,6 @@ class TextProcessor:
         # If all fallbacks failed, warn but continue
         if self.verbose:
             print("Warning: Could not load any tokenizer. Text chunking functionality may be limited.")
-
     
     def load_tokenizer(self, model_name):
         """
@@ -494,18 +618,10 @@ class TextProcessor:
                 if self.verbose:
                     print(f"Using mapped tokenizer: {tokenizer_name}")
             else:
-                # For MLX registry models, check if we have repo info
-                for registry_key, info in MLX_EMBEDDING_REGISTRY.items():
-                    if model_name == registry_key and "repo" in info:
-                        tokenizer_name = info["repo"]
-                        if self.verbose:
-                            print(f"Using tokenizer from registry repo: {tokenizer_name}")
-                        break
-                else:
-                    # If not in registry, use the model name directly
-                    tokenizer_name = model_name
-                    if self.verbose:
-                        print(f"Using direct tokenizer name: {tokenizer_name}")
+                # Using general heuristics for model name
+                tokenizer_name = get_tokenizer_name(model_name)
+                if self.verbose:
+                    print(f"Using direct tokenizer name: {tokenizer_name}")
             
             # Attempt to load the tokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
@@ -518,28 +634,7 @@ class TextProcessor:
                 print("Trying fallback options...")
             
             # Try a series of fallbacks
-            fallbacks = [
-                "sentence-transformers/all-MiniLM-L6-v2",  # Reliable general tokenizer
-                "bert-base-uncased",                      # Basic BERT tokenizer
-                "distilbert-base-uncased",                # DistilBERT tokenizer
-                "gpt2"                                   # GPT tokenizer as last resort
-            ]
-            
-            for fallback in fallbacks:
-                try:
-                    if self.verbose:
-                        print(f"Trying fallback tokenizer: {fallback}")
-                    self.tokenizer = AutoTokenizer.from_pretrained(fallback)
-                    if self.verbose:
-                        print(f"Successfully loaded fallback tokenizer: {fallback}")
-                    break
-                except Exception as fallback_error:
-                    if self.verbose:
-                        print(f"Fallback tokenizer failed: {fallback_error}")
-            
-            # If all fallbacks failed, warn but continue
-            if self.tokenizer is None and self.verbose:
-                print("Warning: Could not load any tokenizer. Text chunking functionality may be limited.")
+            self._load_fallback_tokenizer()
     
     @staticmethod
     def create_smart_preview(text, query, context_size=300):
@@ -805,9 +900,15 @@ class TextProcessor:
             # Tokenizer is already loaded in __init__, so no need to load again
             
             if self.use_mlx:
-                # Load MLX model
+                # Load MLX model - use lazy import
                 if self.verbose:
                     print(f"Using MLX model with weights from {self.weights_path}")
+                
+                # Import MLXModel only when needed
+                _, MLXModel, _, _ = _import_mlx_provider()
+                if MLXModel is None:
+                    raise ImportError("MLXModel not available")
+                    
                 self.mlx_model = MLXModel(self.weights_path, self.verbose)
                 self.mlx_model.load()
                 self.vector_size = self.mlx_model.config.hidden_size
@@ -827,11 +928,43 @@ class TextProcessor:
         except Exception as e:
             print(f"Error loading model: {str(e)}")
             raise
-
-    def _generate_sparse_vector(self, text: str) -> Tuple[List[int], List[float]]:
-        """Generate a sparse vector using the common utility"""
-        return EmbeddingUtils.generate_sparse_vector(text)
     
+    def get_sparse_embedding(self, text: str) -> Tuple[List[int], List[float]]:
+        """
+        Unified method to get sparse embedding from any available provider.
+        
+        Args:
+            text: Text to encode
+            
+        Returns:
+            Tuple of (indices, values) for sparse vector representation
+        """
+        # Check FastEmbed provider first
+        if hasattr(self, 'fastembed_provider') and self.fastembed_provider is not None:
+            try:
+                return self.fastembed_provider.get_sparse_embedding(text)
+            except Exception as e:
+                if self.verbose:
+                    print(f"FastEmbed sparse embedding failed: {e}")
+        
+        # Check MLX provider second
+        if hasattr(self, 'mlx_embedding_provider') and self.mlx_embedding_provider is not None:
+            try:
+                return self.mlx_embedding_provider.get_sparse_embedding(text)
+            except Exception as e:
+                if self.verbose:
+                    print(f"MLX sparse embedding failed: {e}")
+        
+        # Check Ollama provider third
+        if hasattr(self, 'ollama_embedding_provider') and self.ollama_embedding_provider is not None:
+            try:
+                return self.ollama_embedding_provider.get_sparse_embedding(text)
+            except Exception as e:
+                if self.verbose:
+                    print(f"Ollama sparse embedding failed: {e}")
+        
+        # Fall back to basic implementation
+        return EmbeddingUtils.generate_sparse_vector(text)
             
     def get_embedding_pytorch(self, text: str) -> np.ndarray:
         """Get embedding for a text using PyTorch backend"""
@@ -908,6 +1041,8 @@ class TextProcessor:
         # Try to use FastEmbed first if available
         if hasattr(self, 'fastembed_provider') and self.fastembed_provider is not None:
             try:
+                if self.verbose:
+                    print(f"Generating embedding with FastEmbed provider")
                 return self.fastembed_provider.get_dense_embedding(text)
             except Exception as e:
                 if self.verbose:
@@ -917,6 +1052,8 @@ class TextProcessor:
         # Try to use Ollama next if available
         if hasattr(self, 'ollama_embedding_provider') and self.ollama_embedding_provider is not None:
             try:
+                if self.verbose:
+                    print(f"Generating embedding with Ollama provider")
                 return self.ollama_embedding_provider.get_dense_embedding(text)
             except Exception as e:
                 if self.verbose:
@@ -925,19 +1062,31 @@ class TextProcessor:
 
         # Try to use MLX embedding models next if available
         if hasattr(self, 'mlx_embedding_provider') and self.mlx_embedding_provider is not None:
-            try:
-                return self.mlx_embedding_provider.get_dense_embedding(text)
-            except Exception as e:
+            # Check if the dense model is properly loaded
+            if hasattr(self.mlx_embedding_provider, 'dense_model') and self.mlx_embedding_provider.dense_model is not None:
+                try:
+                    if self.verbose:
+                        print(f"Generating embedding with MLX embedding provider")
+                    return self.mlx_embedding_provider.get_dense_embedding(text)
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Error using MLX embedding model: {e}")
+                        print("Falling back to traditional embedding method")
+            else:
                 if self.verbose:
-                    print(f"Error using MLX embedding model: {e}")
+                    print("MLX embedding provider doesn't have a properly initialized dense_model")
                     print("Falling back to traditional embedding method")
 
-        # Use MLX if available
-        if self.use_mlx and self.mlx_model is not None:
+        # Use MLX traditional model if available
+        if self.use_mlx and self.mlx_model is not None and hasattr(self.mlx_model, 'loaded') and self.mlx_model.loaded:
+            if self.verbose:
+                print(f"Using traditional MLX model")
             return self.get_embedding_mlx(text)
 
         # Fall back to PyTorch
         if self.pytorch_model is not None:
+            if self.verbose:
+                print(f"Using PyTorch model")
             return self.get_embedding_pytorch(text)
 
         raise RuntimeError("No valid model backend available (FastEmbed, Ollama, MLX, or PyTorch).")
@@ -1092,12 +1241,9 @@ class TextProcessor:
                     # Get sparse embedding (from batch or individual)
                     if sparse_batch_embeddings and i < len(sparse_batch_embeddings):
                         sparse_embedding = sparse_batch_embeddings[i]
-                    elif hasattr(self, 'mlx_embedding_provider') and self.mlx_embedding_provider is not None:
-                        # Use the new unified get_sparse_embedding method that handles all fallbacks
-                        sparse_embedding = self.mlx_embedding_provider.get_sparse_embedding(chunk["text"])
                     else:
-                        # Use document processor's fallback method
-                        sparse_embedding = self._generate_sparse_vector(chunk["text"])
+                        # Use unified get_sparse_embedding method that handles all fallbacks
+                        sparse_embedding = self.get_sparse_embedding(chunk["text"])
                     
                     # Create payload with embedder information
                     payload = {
@@ -1311,28 +1457,6 @@ class ResultProcessor:
             
             # If we can't adapt, return as is and hope for the best
             return result
-    
-    @staticmethod
-    def adapt_result_simple(result, db_type: str):
-        """Adapt result object from different databases to a common format"""
-        if db_type == "qdrant":
-            # Qdrant results are already in the expected format
-            return result
-        elif db_type == "lancedb":
-            # Convert LanceDB result to common format
-            return {
-                "id": result.get("id", "unknown"),
-                "payload": {
-                    "text": result.get("text", ""),
-                    "file_path": result.get("file_path", ""),
-                    "file_name": result.get("file_name", ""),
-                    "chunk_index": result.get("chunk_index", 0),
-                    "metadata": result.get("metadata", {})
-                },
-                "score": result.get("_distance", 0)
-            }
-        # Add adapters for other database types
-        return result
 
 #######################################
 # SearchAlgorithms Class
@@ -1458,12 +1582,12 @@ class SearchAlgorithms:
     @staticmethod
     def rerank_results(query: str, results, processor: Any, limit: int, verbose: bool = False):
         """
-        Rerank results using a cross-encoder style approach with MLX
+        Rerank results using the best available reranker.
         
         Args:
             query: Original search query
             results: List of search results to rerank
-            processor: Document processor with MLX capabilities
+            processor: Document processor with embedding capabilities
             limit: Maximum number of results to return
             verbose: Whether to show verbose output
             
@@ -1474,7 +1598,7 @@ class SearchAlgorithms:
             return []
         
         if verbose:
-            print(f"Reranking {len(results)} results with MLX")
+            print(f"Reranking {len(results)} results")
         
         # Extract text from results
         passages = []
@@ -1485,80 +1609,119 @@ class SearchAlgorithms:
                 # Use empty string if no text available
                 passages.append("")
         
-        # Reranking depends on which features are available
-        has_mlx_provider = (
-            processor is not None
-            and hasattr(processor, 'mlx_embedding_provider')
-            and processor.mlx_embedding_provider is not None
-        )
-        
-        reranked_scores = []
-        
-        if has_mlx_provider and hasattr(processor.mlx_embedding_provider, 'rerank_with_mlx'):
-            # Use dedicated reranking method if available
-            reranked_scores = processor.mlx_embedding_provider.rerank_with_mlx(query, passages)
-        else:
-            # Fallback: Use ColBERT-style late interaction scoring
+        # Try FastEmbed reranker first
+        if hasattr(processor, 'fastembed_provider') and processor.fastembed_provider is not None:
             try:
-                # Get query embedding
-                query_embedding = processor.get_embedding(query)
-                
-                # Get passage embeddings
-                passage_embeddings = []
-                for passage in passages:
-                    embedding = processor.get_embedding(passage)
-                    passage_embeddings.append(embedding)
-                
-                # Compute similarity scores
-                import numpy as np
-                reranked_scores = []
-                
-                for passage_emb in passage_embeddings:
-                    # Cosine similarity
-                    similarity = np.dot(query_embedding, passage_emb) / (
-                        np.linalg.norm(query_embedding) * np.linalg.norm(passage_emb)
-                    )
-                    reranked_scores.append(float(similarity))
+                reranked_scores = processor.fastembed_provider.rerank_with_fastembed(query, passages)
+                if reranked_scores and len(reranked_scores) == len(results):
+                    if verbose:
+                        print("Using FastEmbed cross-encoder reranking")
+                    
+                    # Create tuples of (result, score) for sorting
+                    scored_results = list(zip(results, reranked_scores))
+                    
+                    # Sort by reranked score
+                    reranked_results = [result for result, _ in sorted(
+                        scored_results, 
+                        key=lambda x: x[1], 
+                        reverse=True
+                    )]
+                    
+                    return reranked_results[:limit]
             except Exception as e:
                 if verbose:
-                    print(f"Error in fallback reranking: {e}")
-                # If reranking fails, keep original order
-                return results[:limit]
+                    print(f"FastEmbed reranking failed: {e}")
         
-        # Create tuples of (result, score) for sorting
-        scored_results = list(zip(results, reranked_scores))
+        # Try MLX reranker next
+        if hasattr(processor, 'mlx_embedding_provider') and processor.mlx_embedding_provider is not None:
+            try:
+                if hasattr(processor.mlx_embedding_provider, 'rerank_with_mlx'):
+                    reranked_scores = processor.mlx_embedding_provider.rerank_with_mlx(query, passages)
+                    if reranked_scores and len(reranked_scores) == len(results):
+                        if verbose:
+                            print("Using MLX cross-encoder reranking")
+                        
+                        # Create tuples of (result, score) for sorting
+                        scored_results = list(zip(results, reranked_scores))
+                        
+                        # Sort by reranked score
+                        reranked_results = [result for result, _ in sorted(
+                            scored_results, 
+                            key=lambda x: x[1], 
+                            reverse=True
+                        )]
+                        
+                        return reranked_results[:limit]
+            except Exception as e:
+                if verbose:
+                    print(f"MLX reranking failed: {e}")
         
-        # Sort by reranked score
-        reranked_results = [result for result, _ in sorted(
-            scored_results, 
-            key=lambda x: x[1], 
-            reverse=True
-        )]
+        # Try Ollama reranker next
+        if hasattr(processor, 'ollama_embedding_provider') and processor.ollama_embedding_provider is not None:
+            try:
+                if hasattr(processor.ollama_embedding_provider, 'rerank_with_ollama'):
+                    reranked_scores = processor.ollama_embedding_provider.rerank_with_ollama(query, passages)
+                    if reranked_scores and len(reranked_scores) == len(results):
+                        if verbose:
+                            print("Using Ollama reranking")
+                        
+                        # Create tuples of (result, score) for sorting
+                        scored_results = list(zip(results, reranked_scores))
+                        
+                        # Sort by reranked score
+                        reranked_results = [result for result, _ in sorted(
+                            scored_results, 
+                            key=lambda x: x[1], 
+                            reverse=True
+                        )]
+                        
+                        return reranked_results[:limit]
+            except Exception as e:
+                if verbose:
+                    print(f"Ollama reranking failed: {e}")
         
-        return reranked_results[:limit]
+        # Fallback: Use ColBERT-style late interaction scoring
+        try:
+            # Get query embedding
+            query_embedding = processor.get_embedding(query)
+            
+            # Get passage embeddings
+            passage_embeddings = []
+            for passage in passages:
+                embedding = processor.get_embedding(passage)
+                passage_embeddings.append(embedding)
+            
+            # Compute similarity scores
+            import numpy as np
+            similarity_scores = []
+            
+            for passage_emb in passage_embeddings:
+                # Cosine similarity
+                similarity = np.dot(query_embedding, passage_emb) / (
+                    np.linalg.norm(query_embedding) * np.linalg.norm(passage_emb)
+                )
+                similarity_scores.append(float(similarity))
+            
+            # Create tuples of (result, score) for sorting
+            scored_results = list(zip(results, similarity_scores))
+            
+            # Sort by similarity score
+            reranked_results = [result for result, _ in sorted(
+                scored_results, 
+                key=lambda x: x[1], 
+                reverse=True
+            )]
+            
+            if verbose:
+                print("Using fallback cosine similarity reranking")
+            
+            return reranked_results[:limit]
+        except Exception as e:
+            if verbose:
+                print(f"Error in fallback reranking: {e}")
+            # If reranking fails, keep original order
+            return results[:limit]
 
-#######################################
-# EmbeddingUtils Class
-#######################################
-
-class EmbeddingUtils:
-    """Utilities for generating embeddings and vector operations"""
-    
-    @staticmethod
-    def generate_sparse_vector(text: str) -> Tuple[List[int], List[float]]:
-        """
-        Generate a simple sparse vector using term frequencies.
-        
-        This is a fallback when no external sparse vector provider is available.
-        
-        Args:
-            text: Text to encode
-                
-        Returns:
-            Tuple of (indices, values) for sparse vector representation
-        """
-        # Use the implementation from mlx module
-        return generate_sparse_vector(text)
 
 #######################################
 # FileUtils Class
@@ -1755,7 +1918,7 @@ class ModelUtils:
             bool: Whether Qdrant is available
         """
         try:
-            if not qdrant_available: # !!!
+            if not qdrant_available:
                 print("Qdrant client not available. Install with: pip install qdrant-client")
                 return False
                 
@@ -1978,18 +2141,37 @@ class ChunkUtils:
         
         for sentence in sentences:
             # Get tokens for this sentence (without special tokens)
-            sentence_tokens = tokenizer.encode(sentence, add_special_tokens=False)
+            # Handle case when tokenizer is not available
+            if tokenizer is None:
+                # Fallback to rough word count
+                sentence_tokens = sentence.split()
+            else:
+                try:
+                    sentence_tokens = tokenizer.encode(sentence, add_special_tokens=False)
+                except Exception:
+                    # If tokenizer fails, fall back to rough word count
+                    sentence_tokens = sentence.split()
             
             # If a single sentence is too long, split it by words
             if len(sentence_tokens) > max_length:
                 # Process any accumulated sentences first
                 if current_chunk_sentences:
                     chunk_text = " ".join(current_chunk_sentences)
-                    chunk_tokens = tokenizer.encode(chunk_text, add_special_tokens=True)
+                    
+                    # Calculate token count for the chunk
+                    if tokenizer is not None:
+                        try:
+                            chunk_tokens = tokenizer.encode(chunk_text, add_special_tokens=True)
+                            token_count = len(chunk_tokens)
+                        except:
+                            # Fallback token count
+                            token_count = len(chunk_text.split())
+                    else:
+                        token_count = len(chunk_text.split())
                     
                     chunks.append({
                         "text": chunk_text,
-                        "token_count": len(chunk_tokens),
+                        "token_count": token_count,
                         "start_idx": 0,
                         "end_idx": 0
                     })
@@ -1999,59 +2181,96 @@ class ChunkUtils:
                 
                 # Split the long sentence into word-level chunks
                 words = sentence.split()
-                current_piece = []
-                current_piece_tokens = []
+                current_piece = []  # Always strings
+                current_piece_token_count = 0  # Count tokens instead of keeping token list
                 
                 for word in words:
-                    word_tokens = tokenizer.encode(word, add_special_tokens=False)
+                    if tokenizer is not None:
+                        try:
+                            word_tokens = tokenizer.encode(word, add_special_tokens=False)
+                            word_token_count = len(word_tokens)
+                        except:
+                            word_token_count = 1  # Fallback: treat as single token
+                    else:
+                        word_token_count = 1  # Fallback: treat as single token
                     
                     # If adding this word would exceed the limit, save the current piece
-                    if len(current_piece_tokens) + len(word_tokens) > max_length:
+                    if current_piece_token_count + word_token_count > max_length:
                         if current_piece:
                             piece_text = " ".join(current_piece)
+                            
                             # Add special tokens for final count
-                            piece_tokens = tokenizer.encode(piece_text, add_special_tokens=True)
+                            if tokenizer is not None:
+                                try:
+                                    piece_tokens = tokenizer.encode(piece_text, add_special_tokens=True)
+                                    token_count = len(piece_tokens)
+                                except:
+                                    # Fallback token count
+                                    token_count = len(piece_text.split())
+                            else:
+                                token_count = len(piece_text.split())
                             
                             chunks.append({
                                 "text": piece_text,
-                                "token_count": len(piece_tokens),
+                                "token_count": token_count,
                                 "start_idx": 0,
                                 "end_idx": 0
                             })
                             
                             # Keep some overlap for context
-                            overlap_tokens = min(overlap, len(current_piece_tokens))
+                            overlap_tokens = min(overlap, current_piece_token_count)
                             if overlap_tokens > 0:
                                 # Keep last few words for overlap
                                 overlap_word_count = max(1, len(current_piece) // 3)
                                 current_piece = current_piece[-overlap_word_count:]
-                                # Recalculate tokens for the overlap portion
-                                overlap_text = " ".join(current_piece)
-                                current_piece_tokens = tokenizer.encode(overlap_text, add_special_tokens=False)
+                                
+                                # Recalculate token count for the overlap portion
+                                current_piece_token_count = 0
+                                if tokenizer is not None:
+                                    try:
+                                        overlap_text = " ".join(current_piece)
+                                        overlap_tokens = tokenizer.encode(overlap_text, add_special_tokens=False)
+                                        current_piece_token_count = len(overlap_tokens)
+                                    except:
+                                        current_piece_token_count = len(current_piece)  # Fallback
+                                else:
+                                    current_piece_token_count = len(current_piece)  # Fallback
                             else:
                                 current_piece = []
-                                current_piece_tokens = []
+                                current_piece_token_count = 0
                         
                         # If the word itself is too long (rare), we must truncate it
-                        if len(word_tokens) > max_length:
-                            trunc_word = word[:int(len(word) * max_length / len(word_tokens))]
+                        if word_token_count > max_length:
+                            # Try to truncate intelligently based on token count
+                            trunc_len = max(1, int(len(word) * (max_length / max(1, word_token_count)) * 0.8))
+                            trunc_word = word[:trunc_len]
                             current_piece.append(trunc_word)
-                            current_piece_tokens = tokenizer.encode(" ".join(current_piece), add_special_tokens=False)
+                            current_piece_token_count = 1  # Approximate for truncated word
                         else:
                             current_piece.append(word)
-                            current_piece_tokens = tokenizer.encode(" ".join(current_piece), add_special_tokens=False)
+                            current_piece_token_count = word_token_count
                     else:
                         current_piece.append(word)
-                        current_piece_tokens = tokenizer.encode(" ".join(current_piece), add_special_tokens=False)
+                        current_piece_token_count += word_token_count
                 
                 # Add the last piece if not empty
                 if current_piece:
                     piece_text = " ".join(current_piece)
-                    piece_tokens = tokenizer.encode(piece_text, add_special_tokens=True)
+                    
+                    # Calculate final token count
+                    if tokenizer is not None:
+                        try:
+                            piece_tokens = tokenizer.encode(piece_text, add_special_tokens=True)
+                            token_count = len(piece_tokens)
+                        except:
+                            # Fallback token count
+                            token_count = len(piece_text.split())
+                    else:
+                        token_count = len(piece_text.split())
                     
                     chunks.append({
                         "text": piece_text,
-                        "token_count": len(piece_tokens),
+                        "token_count": token_count,
                         "start_idx": 0,
                         "end_idx": 0
                     })
@@ -2061,20 +2280,42 @@ class ChunkUtils:
                 current_chunk_tokens = []
             
             # For normal-length sentences, add to current chunk if it fits
-            elif len(current_chunk_tokens) + len(sentence_tokens) <= max_length:
+            elif isinstance(current_chunk_tokens, list) and isinstance(sentence_tokens, list) and len(current_chunk_tokens) + len(sentence_tokens) <= max_length:
                 current_chunk_sentences.append(sentence)
+                
                 # Recalculate tokens to account for spacing and interaction between tokens
-                current_chunk_tokens = tokenizer.encode(" ".join(current_chunk_sentences), add_special_tokens=False)
+                if tokenizer is not None:
+                    try:
+                        current_chunk_tokens = tokenizer.encode(" ".join(current_chunk_sentences), add_special_tokens=False)
+                    except:
+                        # Fallback: just count words
+                        current_chunk_tokens = []
+                        for s in current_chunk_sentences:
+                            current_chunk_tokens.extend(s.split())
+                else:
+                    # Fallback: just count words
+                    current_chunk_tokens = []
+                    for s in current_chunk_sentences:
+                        current_chunk_tokens.extend(s.split())
             else:
                 # Current chunk is full, save it
                 if current_chunk_sentences:
                     chunk_text = " ".join(current_chunk_sentences)
-                    # Add special tokens for final count
-                    chunk_tokens = tokenizer.encode(chunk_text, add_special_tokens=True)
+                    
+                    # Calculate final token count
+                    if tokenizer is not None:
+                        try:
+                            chunk_tokens = tokenizer.encode(chunk_text, add_special_tokens=True)
+                            token_count = len(chunk_tokens)
+                        except:
+                            # Fallback token count
+                            token_count = len(chunk_text.split())
+                    else:
+                        token_count = len(chunk_text.split())
                     
                     chunks.append({
                         "text": chunk_text,
-                        "token_count": len(chunk_tokens),
+                        "token_count": token_count,
                         "start_idx": 0,
                         "end_idx": 0
                     })
@@ -2087,22 +2328,48 @@ class ChunkUtils:
                     
                     # Start new chunk with overlap sentences
                     current_chunk_sentences = overlap_sentences + [sentence]
+                    
                     # Recalculate tokens
-                    current_chunk_tokens = tokenizer.encode(" ".join(current_chunk_sentences), add_special_tokens=False)
+                    if tokenizer is not None:
+                        try:
+                            current_chunk_tokens = tokenizer.encode(" ".join(current_chunk_sentences), add_special_tokens=False)
+                        except:
+                            # Fallback: just count words
+                            current_chunk_tokens = []
+                            for s in current_chunk_sentences:
+                                current_chunk_tokens.extend(s.split())
+                    else:
+                        # Fallback: just count words
+                        current_chunk_tokens = []
+                        for s in current_chunk_sentences:
+                            current_chunk_tokens.extend(s.split())
                 else:
                     # No overlap, just start with current sentence
                     current_chunk_sentences = [sentence]
-                    current_chunk_tokens = sentence_tokens
+                    if isinstance(sentence_tokens, list):
+                        current_chunk_tokens = sentence_tokens
+                    else:
+                        # Fallback: convert to list if needed
+                        current_chunk_tokens = [sentence_tokens]
         
         # Add the last chunk if not empty
         if current_chunk_sentences:
             chunk_text = " ".join(current_chunk_sentences)
-            # Add special tokens for final count
-            chunk_tokens = tokenizer.encode(chunk_text, add_special_tokens=True)
+            
+            # Calculate final token count
+            if tokenizer is not None:
+                try:
+                    chunk_tokens = tokenizer.encode(chunk_text, add_special_tokens=True)
+                    token_count = len(chunk_tokens)
+                except:
+                    # Fallback token count
+                    token_count = len(chunk_text.split())
+            else:
+                token_count = len(chunk_text.split())
             
             chunks.append({
                 "text": chunk_text,
-                "token_count": len(chunk_tokens),
+                "token_count": token_count,
                 "start_idx": 0,
                 "end_idx": 0
             })
@@ -2117,47 +2384,66 @@ class ChunkUtils:
         verified_chunks = []
         
         for chunk in chunks:
+            # Skip empty chunks
+            if not chunk["text"].strip():
+                continue
+                
             # Re-tokenize to ensure accurate count
-            tokens = tokenizer.encode(chunk["text"], add_special_tokens=True)
+            token_count = chunk["token_count"]
+            
+            # If tokenizer is available, double-check token count
+            if tokenizer is not None:
+                try:
+                    tokens = tokenizer.encode(chunk["text"], add_special_tokens=True)
+                    token_count = len(tokens)
+                except:
+                    # If tokenization fails, use existing count
+                    pass
             
             # If chunk is within limit, add it as is
-            if len(tokens) <= max_length:
-                chunk["token_count"] = len(tokens)  # Update the token count
+            if token_count <= max_length:
+                chunk["token_count"] = token_count  # Update the token count
                 verified_chunks.append(chunk)
             else:
-                # For chunks that are still too big, force truncation
-                print(f"Warning: Chunk with {len(tokens)} tokens exceeds limit ({max_length}). Truncating.")
-                
-                # Truncate tokens and decode back to text
-                truncated_tokens = tokens[:max_length]
-                if hasattr(tokenizer, "decode"):
-                    truncated_text = tokenizer.decode(truncated_tokens, skip_special_tokens=False)
-                    
-                    # Create new chunk with truncated text
-                    verified_chunks.append({
-                        "text": truncated_text,
-                        "token_count": len(truncated_tokens),
-                        "start_idx": chunk.get("start_idx", 0),
-                        "end_idx": chunk.get("end_idx", 0),
-                        "paragraph_idx": chunk.get("paragraph_idx", None),
-                        "truncated": True
-                    })
+                # For chunks that are too big, truncate
+                if tokenizer is not None:
+                    try:
+                        # Tokenize and truncate
+                        tokens = tokenizer.encode(chunk["text"], add_special_tokens=True, truncation=True, max_length=max_length)
+                        truncated_text = tokenizer.decode(tokens, skip_special_tokens=False)
+                        
+                        # Create new chunk with truncated text
+                        verified_chunks.append({
+                            "text": truncated_text,
+                            "token_count": len(tokens),
+                            "start_idx": chunk.get("start_idx", 0),
+                            "end_idx": chunk.get("end_idx", 0),
+                            "paragraph_idx": chunk.get("paragraph_idx", None),
+                            "truncated": True
+                        })
+                    except:
+                        # If tokenization fails, use character-based truncation
+                        ratio = max_length / token_count
+                        char_limit = int(len(chunk["text"]) * ratio * 0.9)  # 10% safety margin
+                        truncated_text = chunk["text"][:char_limit]
+                        
+                        verified_chunks.append({
+                            "text": truncated_text,
+                            "token_count": max_length,  # Estimate
+                            "start_idx": chunk.get("start_idx", 0),
+                            "end_idx": chunk.get("end_idx", 0),
+                            "paragraph_idx": chunk.get("paragraph_idx", None),
+                            "truncated": True
+                        })
                 else:
-                    # If tokenizer doesn't support decode, use character-based truncation
-                    ratio = max_length / len(tokens)
+                    # Without a tokenizer, use character-based truncation
+                    ratio = max_length / token_count
                     char_limit = int(len(chunk["text"]) * ratio * 0.9)  # 10% safety margin
                     truncated_text = chunk["text"][:char_limit]
                     
-                    # Verify truncation worked
-                    check_tokens = tokenizer.encode(truncated_text, add_special_tokens=True)
-                    if len(check_tokens) > max_length:
-                        # Further truncate if still too long
-                        char_limit = int(char_limit * max_length / len(check_tokens) * 0.9)
-                        truncated_text = chunk["text"][:char_limit]
-                    
                     verified_chunks.append({
                         "text": truncated_text,
-                        "token_count": min(max_length, len(check_tokens)),
+                        "token_count": max_length,  # Estimate
                         "start_idx": chunk.get("start_idx", 0),
                         "end_idx": chunk.get("end_idx", 0),
                         "paragraph_idx": chunk.get("paragraph_idx", None),
@@ -2185,9 +2471,60 @@ class GeneralUtils:
         Returns:
             Human-readable size string
         """
-        # Copy implementation from get_size_str
-        # Abbreviated - copy 100% from original function
-        pass
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024.0:
+                return f"{size_bytes:.2f} {unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.2f} TB"
+    
+    @staticmethod
+    def check_mlx_embedding_compatibility():
+        """Check MLX embedding models compatibility and available models"""
+        try:
+            import mlx_embedding_models
+            from importlib.metadata import version
+            
+            # Get the version
+            mlx_embed_version = version('mlx_embedding_models')
+            print(f"MLX Embedding Models version: {mlx_embed_version}")
+            
+            # Check supported parameters based on version
+            from mlx_embedding_models import EmbeddingModel
+            import inspect
+            
+            # Get supported parameters for from_pretrained
+            sig = inspect.signature(EmbeddingModel.from_pretrained)
+            params = list(sig.parameters.keys())
+            print(f"Supported parameters for from_pretrained: {', '.join(params)}")
+            
+            # Check if from_registry exists
+            if hasattr(EmbeddingModel, 'from_registry'):
+                # Get available models in registry
+                try:
+                    if hasattr(mlx_embedding_models, 'EMBEDDING_REGISTRY'):
+                        registry = mlx_embedding_models.EMBEDDING_REGISTRY
+                    elif hasattr(mlx_embedding_models.embedding, 'registry'):
+                        registry = mlx_embedding_models.embedding.registry
+                    else:
+                        registry = {}
+                    
+                    print(f"Available models in registry ({len(registry)} models):")
+                    for i, (model_name, config) in enumerate(registry.items()):
+                        ndim = config.get('ndim', 'unknown')
+                        is_sparse = "Yes" if config.get('lm_head', False) else "No"
+                        print(f"  {i+1}. {model_name} - Dim: {ndim}, Sparse: {is_sparse}")
+                except Exception as e:
+                    print(f"Error accessing model registry: {e}")
+            else:
+                print("Warning: from_registry method not available")
+                
+            return True
+        except ImportError:
+            print("MLX Embedding Models not installed")
+            return False
+        except Exception as e:
+            print(f"Error checking MLX embedding compatibility: {e}")
+            return False
     
     @staticmethod
     def check_db_dependencies(db_type: str) -> Tuple[bool, List[str]]:

@@ -1,5 +1,3 @@
-# qdrant_db.py
-
 import os
 import time
 import json
@@ -34,7 +32,7 @@ except ImportError:
 
 
 class QdrantManager(VectorDBInterface):
-    """Manager for Qdrant vector database operations with multi-model support"""
+    """Manager for Qdrant vector database operations with enhanced search capabilities"""
     
     def __init__(self, 
                 host: str = "localhost", 
@@ -74,6 +72,9 @@ class QdrantManager(VectorDBInterface):
         self.dense_model_id = dense_model_id
         self.sparse_model_id = sparse_model_id
         
+        # Performance tracking
+        self._hit_rates = {}
+        
         self.connect()
 
     def is_local(self):
@@ -85,12 +86,38 @@ class QdrantManager(VectorDBInterface):
         dense_id = dense_model_id or self.dense_model_id
         sparse_id = sparse_model_id or self.sparse_model_id
         
-        # Sanitize model IDs
-        dense_id = dense_id.replace("-", "_").replace("/", "_")
-        sparse_id = sparse_id.replace("-", "_").replace("/", "_")
+        # Extract just the final part of the model name if it has slashes
+        # This gives us a more concise name without losing the essential identifier
+        if "/" in dense_id:
+            # For models like "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+            # Just use the part after the last slash
+            dense_base = dense_id.split("/")[-1]
+        else:
+            dense_base = dense_id
+            
+        if "/" in sparse_id:
+            sparse_base = sparse_id.split("/")[-1]
+        else:
+            sparse_base = sparse_id
         
-        dense_vector_name = f"dense_{dense_id}"
-        sparse_vector_name = f"sparse_{sparse_id}"
+        # Now sanitize the base names
+        dense_base = re.sub(r'[^a-zA-Z0-9]', '_', dense_base)
+        sparse_base = re.sub(r'[^a-zA-Z0-9]', '_', sparse_base)
+        
+        # Ensure names don't exceed reasonable lengths
+        max_name_length = 40
+        if len(dense_base) > max_name_length:
+            dense_base = dense_base[:max_name_length]
+        if len(sparse_base) > max_name_length:
+            sparse_base = sparse_base[:max_name_length]
+        
+        dense_vector_name = f"dense_{dense_base}"
+        sparse_vector_name = f"sparse_{sparse_base}"
+        
+        if self.verbose:
+            print(f"Created vector names from models:")
+            print(f"  Dense model: {dense_id} → {dense_vector_name}")
+            print(f"  Sparse model: {sparse_id} → {sparse_vector_name}")
         
         return dense_vector_name, sparse_vector_name
         
@@ -289,8 +316,7 @@ class QdrantManager(VectorDBInterface):
         """
         from qdrant_client.models import Filter, FieldCondition, MatchValue, Range
 
-        # 1) Build a filter for same file_path, 
-        #    and chunk_index in [chunk_index - window, chunk_index + window]
+        # Build a filter for same file_path and chunk_index in [chunk_index - window, chunk_index + window]
         min_idx = max(0, chunk_index - window)
         max_idx = chunk_index + window
 
@@ -307,44 +333,32 @@ class QdrantManager(VectorDBInterface):
             ]
         )
 
-        # 2) We just need to scroll or query all matching points
-        #    Use whichever approach works in your environment:
+        # Use scroll to get matching points
         scroll_result = self.client.scroll(
             collection_name=self.collection_name,
-            limit=50,  # enough to get 2–3 neighbors
+            limit=50,  # enough to get neighboring chunks
             scroll_filter=query_filter,
             with_payload=True
         )
-        # scroll_result is a tuple: (List[RetrievedPoint], optional_next_page_offset)
         points = scroll_result[0]
 
-        # 3) Sort them by chunk_index, then join their text
-        #    (So the center chunk is in the middle.)
+        # Sort by chunk_index to ensure correct order
         sorted_points = sorted(
             points,
             key=lambda p: p.payload.get("chunk_index", 0)
         )
 
-        # Concatenate them
+        # Concatenate the text from all chunks
         combined_text = ""
         for p in sorted_points:
             txt = p.payload.get("text", "")
             if txt.strip():
-                # optional spacing or separators
                 if combined_text:
                     combined_text += "\n"
                 combined_text += txt
 
         return combined_text
 
-    def _generate_sparse_vector(self, text: str) -> Tuple[List[int], List[float]]:
-        """
-        Generate a simple sparse vector using term frequencies.
-        
-        Using the implementation from mlx module.
-        """
-        return generate_sparse_vector(text)
-    
     def get_collection_info(self) -> Dict[str, Any]:
         """Get information about the collection"""
         try:
@@ -409,12 +423,18 @@ class QdrantManager(VectorDBInterface):
                 if self.verbose:
                     print(f"Error extracting sparse vector configs: {e}")
             
+            # Include performance data if available
+            performance = {}
+            if hasattr(self, '_hit_rates') and self._hit_rates:
+                performance["hit_rates"] = self._hit_rates
+            
             return {
                 "name": self.collection_name,
                 "points_count": points_count,
                 "disk_usage": disk_usage,
                 "vector_configs": vector_configs,
-                "sparse_vector_configs": sparse_vector_configs
+                "sparse_vector_configs": sparse_vector_configs,
+                "performance": performance
             }
         except Exception as e:
             if self.verbose:
@@ -423,6 +443,29 @@ class QdrantManager(VectorDBInterface):
                 traceback.print_exc()
             return {"error": str(e)}
     
+    def _record_hit(self, search_type: str, hit: bool):
+        """Record hit for performance tracking"""
+        if not hasattr(self, '_hit_rates'):
+            self._hit_rates = {}
+            
+        if search_type not in self._hit_rates:
+            self._hit_rates[search_type] = {"hits": 0, "total": 0}
+            
+        self._hit_rates[search_type]["total"] += 1
+        if hit:
+            self._hit_rates[search_type]["hits"] += 1
+    
+    def get_hit_rates(self) -> Dict[str, float]:
+        """Get hit rates for different search types"""
+        if not hasattr(self, '_hit_rates'):
+            return {}
+            
+        result = {}
+        for search_type, stats in self._hit_rates.items():
+            if stats["total"] > 0:
+                hit_rate = stats["hits"] / stats["total"]
+                result[search_type] = hit_rate
+        return result
     
     def insert_embeddings(self, embeddings_with_payloads: List[Tuple[np.ndarray, Dict[str, Any]]]) -> None:
         """Insert embeddings into Qdrant (dense only, with generated sparse)"""
@@ -449,8 +492,7 @@ class QdrantManager(VectorDBInterface):
                 text = payload.get("text", "")
                 sparse_indices, sparse_values = generate_sparse_vector(text)
                 
-                # Create point with vectors in the same dictionary
-                # NOTE: This is the corrected format based on Qdrant documentation
+                # Create point with vectors in the correct format
                 vector_dict = {
                     dense_vector_name: embedding.tolist(),
                     sparse_vector_name: {
@@ -487,7 +529,6 @@ class QdrantManager(VectorDBInterface):
             print(f"Error inserting embeddings: {str(e)}")
             raise
 
-    
     def insert_embeddings_with_sparse(self, embeddings_with_sparse: List[Tuple[np.ndarray, Dict[str, Any], Tuple[List[int], List[float]]]]) -> None:
         """
         Insert embeddings with sparse vectors into Qdrant following documentation format.
@@ -511,122 +552,552 @@ class QdrantManager(VectorDBInterface):
             if self.verbose:
                 print(f"Using vector names: {dense_vector_name} (dense) and {sparse_vector_name} (sparse)")
                 
-            # Process and insert one by one to avoid batch issues
-            total_success = 0
-            total_failed = 0
-            
-            for i, (dense_embedding, payload, sparse_embedding) in enumerate(embeddings_with_sparse):
-                # Store file info in metadata
-                if "metadata" not in payload:
-                    payload["metadata"] = {}
-                    
-                file_name = payload.get("file_name", "")
-                chunk_index = payload.get("chunk_index", i)
-                payload["metadata"]["original_file"] = file_name
-                payload["metadata"]["chunk_index"] = chunk_index
+            # Prepare points for insertion
+            points = []
+            for embedding, payload, sparse_vector in embeddings_with_sparse:
+                # Generate a UUID for the point
+                point_id = str(uuid.uuid4())
                 
-                # Get sparse indices and values
-                sparse_indices, sparse_values = sparse_embedding
+                # Extract sparse indices and values
+                sparse_indices, sparse_values = sparse_vector
                 
-                # Validate sparse vectors - warn if they appear to be just a bag of words
-                text_sample = payload.get("text", "")
-                text_length = len(text_sample)
-                token_count = payload.get("token_count", 0)
-
-                # Only warn if the text is substantial but produces a low-quality sparse vector
-                if text_length > 10 and token_count > 5 and (len(sparse_indices) < 5 or max(sparse_values) < 0.1):
-                    if self.verbose:
-                        print(f"⚠️ WARNING: Sparse vector for point {i} appears to be low quality.")
-                        print(f"Indices: {sparse_indices[:5]}...")
-                        print(f"Values: {sparse_values[:5]}...")
-                        
-                        # Show a sample of the text for context
-                        display_text = text_sample[:100] + "..." if text_length > 100 else text_sample
-                        print(f"Text sample ({text_length} chars, {token_count} tokens): '{display_text}'")
-                        print(f"This might be just a bag of words rather than a proper SPLADE vector.")
+                # Format vector dictionary
+                vector_dict = {
+                    dense_vector_name: embedding.tolist(),
+                    sparse_vector_name: {
+                        "indices": sparse_indices,
+                        "values": sparse_values
+                    }
+                }
                 
-                # Try up to 3 times with different IDs if needed
-                max_attempts = 3
-                for attempt in range(max_attempts):
-                    try:
-                        # Generate a new UUID for each attempt
-                        point_id = str(uuid.uuid4())
-                        
-                        # Format vectors according to Qdrant documentation
-                        vector_dict = {
-                            dense_vector_name: dense_embedding.tolist(),
-                            sparse_vector_name: {
-                                "indices": sparse_indices,
-                                "values": sparse_values
-                            }
-                        }
-                        
-                        # Create point with the combined vector dictionary
-                        point = PointStruct(
-                            id=point_id,
-                            vector=vector_dict,
-                            payload=payload
-                        )
-                        
-                        # Before insertion - check what we're about to send
-                        if self.verbose and i == 0:
-                            print(f"\n=== Example point structure for first insertion ===")
-                            print(f"Point ID: {point_id}")
-                            print(f"Vector dict keys: {vector_dict.keys()}")
-                            print(f"Sparse vector has {len(sparse_indices)} indices and {len(sparse_values)} values")
-                            if len(sparse_indices) > 0:
-                                print(f"Sample sparse indices: {sparse_indices[:5]}")
-                                print(f"Sample sparse values: {sparse_values[:5]}")
-
-                        # Insert single point
-                        self.client.upsert(
-                            collection_name=self.collection_name,
-                            points=[point]
-                        )
-                        
-                        # Success
-                        total_success += 1
-                        break
-                        
-                    except Exception as e:
-                        if attempt == max_attempts - 1:
-                            # Last attempt failed
-                            if self.verbose:
-                                print(f"Failed to insert point {i} after {max_attempts} attempts: {e}")
-                            total_failed += 1
-                        elif "Indices must be unique" in str(e):
-                            # Try again with a different ID
-                            if self.verbose:
-                                print(f"ID collision detected on attempt {attempt+1}, retrying...")
-                        else:
-                            # Other error
-                            if self.verbose:
-                                print(f"Error inserting point {i}: {e}")
-                            total_failed += 1
-                            break
+                # Create point with the combined vector dictionary
+                point = PointStruct(
+                    id=point_id,
+                    vector=vector_dict,
+                    payload=payload
+                )
                 
-                # Print progress periodically
-                if self.verbose and (i+1) % 5 == 0:
-                    print(f"Progress: {i+1}/{len(embeddings_with_sparse)} points processed")
+                points.append(point)
             
             if self.verbose:
-                print(f"Indexing complete: {total_success} points inserted, {total_failed} points failed")
+                print(f"Inserting {len(points)} points with sparse vectors into collection '{self.collection_name}'")
+                
+            # Insert points in batches
+            BATCH_SIZE = 100
+            for i in range(0, len(points), BATCH_SIZE):
+                batch = points[i:i+BATCH_SIZE]
+                if self.verbose and len(points) > BATCH_SIZE:
+                    print(f"Inserting batch {i//BATCH_SIZE + 1}/{(len(points)-1)//BATCH_SIZE + 1} ({len(batch)} points)")
+                
+                self.client.upsert(
+                    collection_name=self.collection_name,
+                    points=batch
+                )
+                
+            if self.verbose:
+                print(f"Successfully inserted {len(points)} points with sparse vectors")
                     
         except Exception as e:
             print(f"Error during embeddings insertion: {str(e)}")
             import traceback
             traceback.print_exc()
-    
 
-    def _create_preview(self, text, query, context_size=300):
+    def _get_reranker(self, reranker_type: str):
         """
-        Create a preview with context around search terms.
+        Get a reranker for Qdrant results
         
-        Using the implementation from TextProcessor.
+        Since Qdrant doesn't have built-in rerankers like LanceDB, we'll use SearchAlgorithms helpers
+        for reranking after we get the initial results.
+        
+        Args:
+            reranker_type: Type of reranker to use ('rrf', 'linear', 'dbsf', 'colbert', 'cohere', 'jina', 'cross')
+            
+        Returns:
+            Reranker function
         """
-        return TextProcessor.create_preview(text, query, context_size)
+        # We don't implement actual rerankers here, just return the type for later processing
+        return reranker_type.lower()
 
-    
+    def search_hybrid(self, query: str, processor: Any, limit: int, 
+                    prefetch_limit: int = 50, fusion_type: str = "rrf",
+                    score_threshold: float = None, rerank: bool = False,
+                    reranker_type: str = None):
+        """
+        Perform a hybrid search combining both dense and sparse vectors with optional reranking
+        
+        Args:
+            query: Original search query
+            processor: Document processor with embedding capabilities
+            limit: Maximum number of results to return
+            prefetch_limit: Number of results to prefetch for fusion
+            fusion_type: Type of fusion to use (rrf or dbsf)
+            score_threshold: Minimum score threshold
+            rerank: Whether to apply reranking as a third step
+            reranker_type: Type of reranker to use (not directly used in Qdrant, but tracked for metrics)
+        """
+        if processor is None:
+            return {"error": "Hybrid search requires an embedding model"}
+        
+        try:
+            # Generate query vector
+            query_vector = processor.get_embedding(query)
+            
+            # Generate sparse vector for the query
+            sparse_indices, sparse_values = processor.get_sparse_embedding(query)
+            
+            # Get vector names
+            dense_vector_name, sparse_vector_name = self._get_vector_names()
+            
+            # Calculate oversampling factor
+            oversample_factor = 3 if rerank else 1
+            fetch_limit = min(prefetch_limit, limit * oversample_factor)
+            
+            if self.verbose:
+                print(f"Performing hybrid search for: '{query}'")
+                if rerank:
+                    print(f"Will oversample by factor {oversample_factor} for reranking")
+            
+            # Perform hybrid search using native fusion if available
+            try:
+                from qdrant_client.models import Prefetch, FusionQuery, Fusion, SparseVector
+                
+                # Create prefetch list
+                prefetch_list = [
+                    # Dense vector prefetch
+                    Prefetch(
+                        query=query_vector.tolist(),
+                        using=dense_vector_name,
+                        limit=fetch_limit,
+                    ),
+                    # Sparse vector prefetch 
+                    Prefetch(
+                        query=SparseVector(
+                            indices=sparse_indices,
+                            values=sparse_values
+                        ),
+                        using=sparse_vector_name,
+                        limit=fetch_limit,
+                    )
+                ]
+                
+                # Choose fusion method
+                fusion_enum = Fusion.DBSF if fusion_type.lower() == "dbsf" else Fusion.RRF
+                
+                # Hybrid query
+                response = self.client.query_points(
+                    collection_name=self.collection_name,
+                    prefetch=prefetch_list,
+                    query=FusionQuery(fusion=fusion_enum),
+                    limit=fetch_limit,
+                    with_payload=True
+                )
+                
+                points = response.points
+                
+                if self.verbose:
+                    print(f"Hybrid search with fusion returned {len(points)} results")
+                    
+            except Exception as e:
+                if self.verbose:
+                    print(f"Modern fusion-based hybrid search failed: {e}")
+                    print("Using manual hybrid search approach")
+                
+                # Perform separate searches and combine manually
+                dense_results = self.search_dense(query, processor, fetch_limit, score_threshold)
+                if isinstance(dense_results, dict) and "error" in dense_results:
+                    dense_results = []
+                
+                sparse_results = self.search_sparse(query, processor, fetch_limit, score_threshold)
+                if isinstance(sparse_results, dict) and "error" in sparse_results:
+                    sparse_results = []
+                    
+                # Combine and rerank results using appropriate fusion strategy
+                points = SearchAlgorithms.manual_fusion(
+                    dense_results, 
+                    sparse_results, 
+                    fetch_limit, 
+                    fusion_type
+                )
+            
+            # Apply reranking if requested
+            if rerank and len(points) > 0:
+                if self.verbose:
+                    print(f"Applying {reranker_type or 'default'} reranking to {len(points)} results")
+                
+                points = SearchAlgorithms.rerank_results(query, points, processor, limit, self.verbose)
+                
+                # Record metrics if ground truth is available
+                true_context = getattr(processor, 'expected_context', None)
+                if true_context:
+                    hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in points)
+                    search_key = f"hybrid_{fusion_type}"
+                    if rerank:
+                        search_key += f"_{reranker_type or 'default'}"
+                    self._record_hit(search_key, hit)
+                
+            # Apply score threshold if not already applied
+            if score_threshold is not None:
+                points = [p for p in points if ResultProcessor.get_score(p) >= score_threshold]
+                
+            # Limit to requested number
+            points = points[:limit]
+            
+            return points
+        
+        except Exception as e:
+            print(f"Error in hybrid search: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return SearchAlgorithms.handle_search_error("qdrant", "hybrid", e, self.verbose)
+
+    def search(self, query: str, search_type: str = "hybrid", limit: int = 10,
+            processor: Any = None, prefetch_limit: int = 50, fusion_type: str = "rrf",
+            relevance_tuning: bool = True, context_size: int = 300, 
+            score_threshold: float = None, rerank: bool = False,
+            reranker_type: str = None):
+        """
+        Enhanced search using dense, sparse, or hybrid search with improved relevance
+        and optional reranking stage.
+        
+        Args:
+            query: Search query string
+            search_type: Type of search to perform (hybrid, vector, sparse, keyword)
+            limit: Maximum number of results to return
+            processor: Document processor with embedding capabilities
+            prefetch_limit: Number of results to prefetch for fusion
+            fusion_type: Type of fusion to use (rrf or dbsf)
+            relevance_tuning: Whether to apply relevance tuning
+            context_size: Size of context window for preview
+            score_threshold: Minimum score threshold
+            rerank: Whether to apply reranking as a third step
+            reranker_type: Type of reranker to use (not directly used in Qdrant, but tracked for metrics)
+            
+        Returns:
+            Dictionary with search results and metadata
+        """
+        try:
+            query = query.strip()
+            if not query:
+                return {"error": "Empty query"}
+            
+            if self.verbose:
+                print(f"Searching for '{query}' using {search_type} search" + 
+                    (" with reranking" if rerank else ""))
+            
+            # Check if collection exists
+            collections = self.client.get_collections().collections
+            if not any(c.name == self.collection_name for c in collections):
+                return {"error": f"Collection {self.collection_name} does not exist"}
+            
+            # Calculate oversampling factor
+            oversample_factor = 3 if rerank else 1
+            
+            # Determine correct search method based on type
+            if search_type.lower() in ["vector", "dense"]:
+                # Check if processor is available for vector search
+                if processor is None:
+                    return {"error": "Vector search requires an embedding model"}
+                points = self.search_dense(query, processor, limit * oversample_factor if rerank else limit, score_threshold)
+            elif search_type.lower() == "sparse":
+                # Check if processor is available for sparse search
+                if processor is None:
+                    return {"error": "Sparse search requires an embedding model"}
+                points = self.search_sparse(query, processor, limit * oversample_factor if rerank else limit, score_threshold)
+            elif search_type.lower() in ["keyword", "fts"]:
+                # Keyword search doesn't require a processor
+                points = self.search_keyword(query, limit * oversample_factor if rerank else limit, score_threshold)
+            else:  # Default to hybrid
+                # Check if processor is available for hybrid search
+                if processor is None:
+                    return {"error": "Hybrid search requires an embedding model"}
+                points = self.search_hybrid(query, processor, limit, prefetch_limit, 
+                                        fusion_type, score_threshold, rerank, reranker_type)
+            
+            # Check for errors
+            if isinstance(points, dict) and "error" in points:
+                return points
+                
+            # Apply reranking as a separate step if requested and not already done in the search method
+            if rerank and search_type.lower() != "hybrid" and not isinstance(points, dict) and processor is not None:
+                if self.verbose:
+                    print(f"Applying {reranker_type or 'default'} reranking to {len(points)} results")
+                
+                points = SearchAlgorithms.rerank_results(query, points, processor, limit, self.verbose)
+                
+                # Record metrics if ground truth is available
+                true_context = getattr(processor, 'expected_context', None)
+                if true_context:
+                    hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in points)
+                    search_key = f"{search_type}"
+                    if rerank:
+                        search_key += f"_{reranker_type or 'default'}"
+                    self._record_hit(search_key, hit)
+            
+            # Format results with improved preview
+            return self._format_search_results(points, query, search_type, processor, context_size)
+            
+        except Exception as e:
+            print(f"Error during search: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return {"error": str(e)}
+
+    def search_dense(self, query: str, processor: Any, limit: int, score_threshold: float = None):
+        """Perform dense vector search with consistent handling"""
+        if processor is None:
+            return {"error": "Dense search requires an embedding model"}
+        
+        try:
+            # Get dense vector name with consistent sanitization
+            dense_model_id = getattr(processor, 'dense_model_id', self.dense_model_id)
+            dense_vector_name, _ = self._get_vector_names(dense_model_id, None)
+            
+            if self.verbose:
+                print(f"Using vector name for dense search: {dense_vector_name}")
+            
+            # Generate dense embedding
+            query_vector = processor.get_embedding(query)
+            
+            # Attempt to use different search methods in order of preference
+            try:
+                # Modern approach with specific vector name
+                search_result = self.client.search(
+                    collection_name=self.collection_name,
+                    query_vector=(dense_vector_name, query_vector.tolist()),
+                    limit=limit * 3,  # Get more results than needed for filtering
+                    with_payload=True,
+                    score_threshold=score_threshold
+                )
+                
+                # Filter out problematic tiny chunks (less than 20 characters)
+                filtered_results = []
+                for point in search_result:
+                    if hasattr(point, "payload") and point.payload and "text" in point.payload:
+                        text = point.payload.get("text", "")
+                        # Only include chunks with meaningful content
+                        if len(text) >= 20:
+                            filtered_results.append(point)
+                
+                if self.verbose:
+                    print(f"Dense search returned {len(search_result)} raw results")
+                    print(f"After filtering tiny chunks: {len(filtered_results)} results")
+                
+                # Record metrics if ground truth is available
+                true_context = getattr(processor, 'expected_context', None)
+                if true_context:
+                    hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in filtered_results)
+                    self._record_hit("vector", hit)
+                
+                # Limit to requested number
+                return filtered_results[:limit]
+                
+            except Exception as e:
+                if self.verbose:
+                    print(f"Standard dense search failed: {e}")
+                    print("Trying alternative dense search methods...")
+                
+                # Try with query_points API
+                try:
+                    result = self.client.query_points(
+                        collection_name=self.collection_name,
+                        query=query_vector.tolist(),
+                        using=dense_vector_name,
+                        limit=limit * 3,  # Get more results than needed for filtering
+                        with_payload=True,
+                        score_threshold=score_threshold
+                    )
+                    
+                    # Filter out problematic tiny chunks
+                    filtered_results = []
+                    for point in result.points:
+                        if hasattr(point, "payload") and point.payload and "text" in point.payload:
+                            text = point.payload.get("text", "")
+                            # Only include chunks with meaningful content
+                            if len(text) >= 20:
+                                filtered_results.append(point)
+                    
+                    if self.verbose:
+                        print(f"Dense search with query_points returned {len(result.points)} raw results")
+                        print(f"After filtering tiny chunks: {len(filtered_results)} results")
+                    
+                    # Record metrics if ground truth is available
+                    true_context = getattr(processor, 'expected_context', None)
+                    if true_context:
+                        hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in filtered_results)
+                        self._record_hit("vector", hit)
+                    
+                    # Limit to requested number
+                    return filtered_results[:limit]
+                    
+                except Exception as e2:
+                    # Last resort - try without named vectors
+                    try:
+                        search_result = self.client.search(
+                            collection_name=self.collection_name,
+                            query_vector=query_vector.tolist(),
+                            limit=limit * 3,  # Get more results than needed for filtering
+                            with_payload=True,
+                            score_threshold=score_threshold
+                        )
+                        
+                        # Filter out problematic tiny chunks
+                        filtered_results = []
+                        for point in search_result:
+                            if hasattr(point, "payload") and point.payload and "text" in point.payload:
+                                text = point.payload.get("text", "")
+                                # Only include chunks with meaningful content
+                                if len(text) >= 20:
+                                    filtered_results.append(point)
+                        
+                        if self.verbose:
+                            print(f"Dense search with legacy method returned {len(search_result)} raw results")
+                            print(f"After filtering tiny chunks: {len(filtered_results)} results")
+                        
+                        # Record metrics if ground truth is available
+                        true_context = getattr(processor, 'expected_context', None)
+                        if true_context:
+                            hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in filtered_results)
+                            self._record_hit("vector", hit)
+                        
+                        # Limit to requested number
+                        return filtered_results[:limit]
+                        
+                    except Exception as e3:
+                        return {"error": f"All dense search methods failed: {e3}"}
+        
+        except Exception as e:
+            print(f"Error in dense search: {str(e)}")
+            return {"error": f"Error in dense search: {str(e)}"}
+
+    def search_sparse(self, query: str, processor: Any, limit: int, score_threshold: float = None):
+        """
+        Perform sparse vector search according to Qdrant documentation format
+        """
+        if processor is None:
+            return {"error": "Sparse search requires an embedding model"}
+        
+        # Get vector names
+        has_mlx_provider = (
+            processor is not None
+            and hasattr(processor, 'mlx_embedding_provider')
+            and processor.mlx_embedding_provider is not None
+        )
+        dense_model_id = getattr(processor, 'dense_model_id', self.dense_model_id)
+        sparse_model_id = getattr(processor, 'sparse_model_id', self.sparse_model_id)
+        _, sparse_vector_name = self._get_vector_names(dense_model_id, sparse_model_id)
+        
+        if self.verbose:
+            print(f"[DEBUG] Sparse search using vector name '{sparse_vector_name}'")
+
+        try:
+            # Generate sparse vector
+            if has_mlx_provider:
+                sparse_indices, sparse_values = processor.mlx_embedding_provider.get_sparse_embedding(query)
+            else:
+                sparse_indices, sparse_values = processor.get_sparse_embedding(query)
+            
+            # Warn if this appears to be just a bag of words
+            if len(sparse_indices) < 5 or max(sparse_values) < 0.1:
+                print(f"⚠️ WARNING: Sparse vector appears to be low quality (possibly just a bag of words).")
+                print(f"This might significantly reduce search quality.")
+                
+            if self.verbose:
+                print(f"[DEBUG] Created sparse vector with {len(sparse_indices)} non-zero terms")
+                if len(sparse_indices) > 0:
+                    print(f"Sample indices: {sparse_indices[:5]}")
+                    print(f"Sample values: {sparse_values[:5]}")
+            
+            # Perform search according to Qdrant documentation format
+            try:
+                # Format the query according to Qdrant documentation
+                search_result = self.client.search(
+                    collection_name=self.collection_name,
+                    query_vector=(sparse_vector_name, {
+                        "indices": sparse_indices,
+                        "values": sparse_values
+                    }),
+                    limit=limit,
+                    with_payload=True,
+                    score_threshold=score_threshold
+                )
+                
+                if self.verbose:
+                    print(f"[DEBUG] Sparse search returned {len(search_result)} results")
+                
+                # Record metrics if ground truth is available
+                true_context = getattr(processor, 'expected_context', None)
+                if true_context:
+                    hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in search_result)
+                    self._record_hit("sparse", hit)
+                
+                return search_result
+                
+            except Exception as e:
+                if self.verbose:
+                    print(f"[ERROR] Standard sparse search failed: {e}")
+                    print("Trying alternative sparse search methods...")
+                
+                # Try with NamedSparseVector format (newer Qdrant versions)
+                try:
+                    from qdrant_client.models import NamedSparseVector, SparseVector
+                    search_result = self.client.search(
+                        collection_name=self.collection_name,
+                        query_vector=NamedSparseVector(
+                            name=sparse_vector_name,
+                            vector=SparseVector(
+                                indices=sparse_indices,
+                                values=sparse_values
+                            )
+                        ),
+                        limit=limit,
+                        with_payload=True,
+                        score_threshold=score_threshold
+                    )
+                    
+                    if self.verbose:
+                        print(f"[DEBUG] Alternative sparse search returned {len(search_result)} results")
+                    
+                    # Record metrics if ground truth is available
+                    true_context = getattr(processor, 'expected_context', None)
+                    if true_context:
+                        hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in search_result)
+                        self._record_hit("sparse", hit)
+                    
+                    return search_result
+                    
+                except Exception as e2:
+                    # Last resort - try with query_points
+                    try:
+                        from qdrant_client.models import SparseVector
+                        result = self.client.query_points(
+                            collection_name=self.collection_name,
+                            query=SparseVector(
+                                indices=sparse_indices,
+                                values=sparse_values
+                            ),
+                            using=sparse_vector_name,
+                            limit=limit,
+                            with_payload=True,
+                            score_threshold=score_threshold
+                        )
+                        
+                        if self.verbose:
+                            print(f"[DEBUG] query_points sparse search returned {len(result.points)} results")
+                        
+                        # Record metrics if ground truth is available
+                        true_context = getattr(processor, 'expected_context', None)
+                        if true_context:
+                            hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in result.points)
+                            self._record_hit("sparse", hit)
+                        
+                        return result.points
+                    except Exception as e3:
+                        return {"error": f"All sparse search methods failed: {e3}"}
+        
+        except Exception as e:
+            print(f"Error generating sparse vectors: {e}")
+            return SearchAlgorithms.handle_search_error("qdrant", "sparse", e, self.verbose)
+
     def search_keyword(self, query: str, limit: int = 10, score_threshold: float = None):
         """
         Perform a keyword-based search optimized for local Qdrant installations.
@@ -948,6 +1419,12 @@ class QdrantManager(VectorDBInterface):
                 
                 if self.verbose:
                     print(f"Final result: {len(points)} validated keyword matches")
+                
+                # Record metrics if ground truth is available - FIXED: only use if processor is provided
+                # This was causing the error
+                # if true_context := getattr(processor, 'expected_context', None):
+                #     hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in points)
+                #     self._record_hit("keyword", hit)
                     
                 return points
                 
@@ -958,412 +1435,8 @@ class QdrantManager(VectorDBInterface):
             print(f"Error in keyword search: {str(e)}")
             import traceback
             traceback.print_exc()
+            from utils import SearchAlgorithms
             return SearchAlgorithms.handle_search_error("qdrant", "keyword", e, self.verbose)
-
-    def _generate_sparse_vector(self, text: str) -> Tuple[List[int], List[float]]:
-        """
-        Generate a simple sparse vector using term frequencies.
-        
-        Using the implementation from EmbeddingUtils.
-        """
-        return generate_sparse_vector(text)
-
-    
-    def search_hybrid(self, query: str, processor: Any, limit: int, 
-                    prefetch_limit: int = 50, fusion_type: str = "rrf",
-                    score_threshold: float = None, rerank: bool = False):
-        """
-        Perform a hybrid search combining both dense and sparse vectors with optional reranking
-        
-        Args:
-            query: Search query string
-            processor: Document processor with embedding capabilities
-            limit: Number of results to return
-            prefetch_limit: Number of results to prefetch for fusion
-            fusion_type: Type of fusion to use (rrf or dbsf)
-            score_threshold: Minimum score threshold
-            rerank: Whether to apply reranking as a third step
-            
-        Returns:
-            List of search results
-        """
-        if processor is None:
-            return {"error": "Hybrid search requires an embedding model"}
-        
-        try:
-            # Get vector names with consistent sanitization
-            has_mlx_provider = (
-                processor is not None
-                and hasattr(processor, 'mlx_embedding_provider')
-                and processor.mlx_embedding_provider is not None
-            )
-            dense_model_id = getattr(processor, 'dense_model_id', self.dense_model_id)
-            sparse_model_id = getattr(processor, 'sparse_model_id', self.sparse_model_id)
-            dense_vector_name, sparse_vector_name = self._get_vector_names(dense_model_id, sparse_model_id)
-            
-            if self.verbose:
-                print(f"Using vector names for hybrid search: {dense_vector_name} (dense) and {sparse_vector_name} (sparse)")
-            
-            # Generate dense embedding
-            query_vector = processor.get_embedding(query)
-            
-            # Generate sparse embedding
-            if has_mlx_provider:
-                sparse_indices, sparse_values = processor.mlx_embedding_provider.get_sparse_embedding(query)
-            else:
-                sparse_indices, sparse_values = generate_sparse_vector(query)
-                
-            # Warn if sparse vector appears to be just a bag of words
-            if len(sparse_indices) < 5 or max(sparse_values) < 0.1:
-                print(f"⚠️ WARNING: Sparse vector appears to be low quality (possibly just a bag of words).")
-                print(f"This might reduce hybrid search quality.")
-            
-            # Try using modern fusion API first
-            try:
-                from qdrant_client.models import Prefetch, FusionQuery, Fusion, SparseVector
-                
-                # Create prefetch list
-                prefetch_list = [
-                    # Dense vector prefetch
-                    Prefetch(
-                        query=query_vector.tolist(),
-                        using=dense_vector_name,
-                        limit=prefetch_limit,
-                    ),
-                    # Sparse vector prefetch 
-                    Prefetch(
-                        query=SparseVector(
-                            indices=sparse_indices,
-                            values=sparse_values
-                        ),
-                        using=sparse_vector_name,
-                        limit=prefetch_limit,
-                    )
-                ]
-                
-                # Choose fusion method
-                fusion_enum = Fusion.DBSF if fusion_type.lower() == "dbsf" else Fusion.RRF
-                
-                # Hybrid query
-                response = self.client.query_points(
-                    collection_name=self.collection_name,
-                    prefetch=prefetch_list,
-                    query=FusionQuery(fusion=fusion_enum),
-                    limit=limit * 3 if rerank else limit,  # Get more if we're going to rerank
-                    with_payload=True
-                )
-                
-                points = response.points
-                
-                if self.verbose:
-                    print(f"Hybrid search with fusion returned {len(points)} results")
-                    
-            except Exception as e:
-                if self.verbose:
-                    print(f"Modern fusion-based hybrid search failed: {e}")
-                    print("Using manual hybrid search approach")
-                
-                # Perform separate searches and combine manually
-                dense_results = self.search_dense(query, processor, prefetch_limit, score_threshold)
-                if "error" in dense_results:
-                    dense_results = []
-                
-                sparse_results = self.search_sparse(query, processor, prefetch_limit, score_threshold)
-                if "error" in sparse_results:
-                    sparse_results = []
-                    
-                # Combine and rerank results using reciprocal rank fusion
-                points = self._manual_fusion(dense_results, sparse_results, 
-                                            limit * 3 if rerank else limit, 
-                                            fusion_type)
-            
-            # Apply reranking if requested
-            if rerank and len(points) > 0:
-                if self.verbose:
-                    print(f"Applying reranking to {len(points)} results")
-                
-                points = SearchAlgorithms._rerank_results(query, points, processor, limit)
-                
-            # Apply score threshold if not already applied
-            if score_threshold is not None:
-                points = [p for p in points if self._get_score(p) >= score_threshold]
-                
-            # Limit to requested number
-            points = points[:limit]
-            
-            return points
-        
-        except Exception as e:
-            print(f"Error in hybrid search: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return SearchAlgorithms.handle_search_error("qdrant", "hybrid", e, self.verbose)
-
-    def search_dense(self, query: str, processor: Any, limit: int, score_threshold: float = None):
-        """
-        Perform a dense vector search with consistent handling
-        
-        Args:
-            query: Search query string
-            processor: Document processor with embedding capabilities
-            limit: Number of results to return
-            score_threshold: Minimum score threshold
-            
-        Returns:
-            List of search results
-        """
-        if processor is None:
-            return {"error": "Dense search requires an embedding model"}
-        
-        try:
-            # Get dense vector name with consistent sanitization
-            dense_model_id = getattr(processor, 'dense_model_id', self.dense_model_id)
-            dense_vector_name, _ = self._get_vector_names(dense_model_id, None)
-            
-            if self.verbose:
-                print(f"Using vector name for dense search: {dense_vector_name}")
-            
-            # Generate dense embedding
-            query_vector = processor.get_embedding(query)
-            
-            # Attempt to use different search methods in order of preference
-            try:
-                # Modern approach with specific vector name
-                search_result = self.client.search(
-                    collection_name=self.collection_name,
-                    query_vector=(dense_vector_name, query_vector.tolist()),
-                    limit=limit,
-                    with_payload=True,
-                    score_threshold=score_threshold
-                )
-                
-                if self.verbose:
-                    print(f"Dense search returned {len(search_result)} results")
-                
-                return search_result
-                
-            except Exception as e:
-                if self.verbose:
-                    print(f"Standard dense search failed: {e}")
-                    print("Trying alternative dense search methods...")
-                
-                # Try with query_points API
-                try:
-                    result = self.client.query_points(
-                        collection_name=self.collection_name,
-                        query=query_vector.tolist(),
-                        using=dense_vector_name,
-                        limit=limit,
-                        with_payload=True,
-                        score_threshold=score_threshold
-                    )
-                    
-                    if self.verbose:
-                        print(f"Dense search with query_points returned {len(result.points)} results")
-                    
-                    return result.points
-                    
-                except Exception as e2:
-                    # Last resort - try without named vectors
-                    try:
-                        search_result = self.client.search(
-                            collection_name=self.collection_name,
-                            query_vector=query_vector.tolist(),
-                            limit=limit,
-                            with_payload=True,
-                            score_threshold=score_threshold
-                        )
-                        
-                        if self.verbose:
-                            print(f"Dense search with legacy method returned {len(search_result)} results")
-                        
-                        return search_result
-                        
-                    except Exception as e3:
-                        return {"error": f"All dense search methods failed: {e3}"}
-        
-        except Exception as e:
-            print(f"Error in dense search: {str(e)}")
-            return {"error": f"Error in dense search: {str(e)}"}
-
-    def _manual_fusion(self, dense_results, sparse_results, limit: int, fusion_type: str = "rrf"):
-        """
-        Perform manual fusion of dense and sparse search results
-        
-        Args:
-            dense_results: Results from dense search
-            sparse_results: Results from sparse search
-            limit: Maximum number of results to return
-            fusion_type: Type of fusion to use (rrf or dbsf)
-            
-        Returns:
-            Combined and reranked list of results
-        """
-        # Safety check for inputs
-        if not dense_results and not sparse_results:
-            return []
-        
-        # Helper function to get score safely
-        def get_score(item):
-            return getattr(item, "score", 0.0)
-        
-        # Dictionary to store combined results with ID as key
-        combined_dict = {}
-        
-        # Process dense results
-        for rank, item in enumerate(dense_results):
-            item_id = getattr(item, "id", str(rank))
-            combined_dict[item_id] = {
-                "item": item,
-                "dense_rank": rank + 1,
-                "dense_score": get_score(item),
-                "sparse_rank": float('inf'),
-                "sparse_score": 0.0
-            }
-        
-        # Process sparse results
-        for rank, item in enumerate(sparse_results):
-            item_id = getattr(item, "id", str(rank))
-            if item_id in combined_dict:
-                # Update existing entry
-                combined_dict[item_id]["sparse_rank"] = rank + 1
-                combined_dict[item_id]["sparse_score"] = get_score(item)
-            else:
-                # Add new entry
-                combined_dict[item_id] = {
-                    "item": item,
-                    "dense_rank": float('inf'),
-                    "dense_score": 0.0,
-                    "sparse_rank": rank + 1,
-                    "sparse_score": get_score(item)
-                }
-        
-        # Apply fusion based on chosen method
-        if fusion_type.lower() == "dbsf":
-            # Distribution-based Score Fusion
-            # Normalize scores within each result set
-            dense_max = max([d["dense_score"] for d in combined_dict.values()]) if dense_results else 1.0
-            sparse_max = max([d["sparse_score"] for d in combined_dict.values()]) if sparse_results else 1.0
-            
-            # Calculate combined scores
-            for item_id, data in combined_dict.items():
-                norm_dense = data["dense_score"] / dense_max if dense_max > 0 else 0
-                norm_sparse = data["sparse_score"] / sparse_max if sparse_max > 0 else 0
-                
-                # DBSF: Weighted sum of normalized scores
-                data["combined_score"] = 0.5 * norm_dense + 0.5 * norm_sparse
-        else:
-            # Reciprocal Rank Fusion (default)
-            k = 60  # Constant for RRF
-            
-            # Calculate combined scores using RRF formula
-            for item_id, data in combined_dict.items():
-                rrf_dense = 1.0 / (k + data["dense_rank"]) if data["dense_rank"] != float('inf') else 0
-                rrf_sparse = 1.0 / (k + data["sparse_rank"]) if data["sparse_rank"] != float('inf') else 0
-                
-                # RRF: Sum of reciprocal ranks
-                data["combined_score"] = rrf_dense + rrf_sparse
-        
-        # Sort by combined score and convert back to a list
-        sorted_results = sorted(
-            combined_dict.values(), 
-            key=lambda x: x["combined_score"], 
-            reverse=True
-        )
-        
-        # Return only the original items, limited to requested count
-        return [data["item"] for data in sorted_results[:limit]]
-    
-    def _rerank_results(self, query: str, results, processor: Any, limit: int):
-        """
-        Rerank results using a cross-encoder style approach with MLX
-        
-        Args:
-            query: Original search query
-            results: List of search results to rerank
-            processor: Document processor with MLX capabilities
-            limit: Maximum number of results to return
-            
-        Returns:
-            Reranked list of results
-        """
-        # Use the SearchAlgorithms implementation instead of duplicating code
-        return SearchAlgorithms.rerank_results(query, results, processor, limit, verbose=self.verbose)
-    
-
-    def _get_score(self, result):
-        """Safely get score from a result"""
-        return ResultProcessor.get_score(result)
-
-
-    def search(self, query: str, search_type: str = "hybrid", limit: int = 10,
-            processor: Any = None, prefetch_limit: int = 50, fusion_type: str = "rrf",
-            relevance_tuning: bool = True, context_size: int = 300, 
-            score_threshold: float = None, rerank: bool = False):
-        """
-        Enhanced search using dense, sparse, or hybrid search with improved relevance
-        and optional reranking stage.
-        
-        Args:
-            query: Search query string
-            search_type: Type of search to perform (hybrid, vector, sparse, keyword)
-            limit: Maximum number of results to return
-            processor: Document processor with embedding capabilities
-            prefetch_limit: Number of results to prefetch for fusion
-            fusion_type: Type of fusion to use (rrf or dbsf)
-            relevance_tuning: Whether to apply relevance tuning
-            context_size: Size of context window for preview
-            score_threshold: Minimum score threshold
-            rerank: Whether to apply reranking as a third step
-            
-        Returns:
-            Dictionary with search results and metadata
-        """
-        try:
-            query = query.strip()
-            if not query:
-                return {"error": "Empty query"}
-            
-            if self.verbose:
-                print(f"Searching for '{query}' using {search_type} search" + 
-                    (" with reranking" if rerank else ""))
-            
-            # Check if collection exists
-            collections = self.client.get_collections().collections
-            if not any(c.name == self.collection_name for c in collections):
-                return {"error": f"Collection {self.collection_name} does not exist"}
-            
-            # Determine correct search method based on type
-            if search_type == "vector" or search_type == "dense":
-                points = self.search_dense(query, processor, limit * 3 if rerank else limit, score_threshold)
-            elif search_type == "sparse":
-                points = self.search_sparse(query, processor, limit * 3 if rerank else limit, score_threshold)
-            elif search_type == "keyword":
-                points = self.search_keyword(query, limit * 3 if rerank else limit)
-            else:  # Default to hybrid
-                points = self.search_hybrid(query, processor, limit, prefetch_limit, 
-                                            fusion_type, score_threshold, rerank=False)
-            
-            # Apply reranking as a third step if requested and not already applied
-            if rerank and search_type != "hybrid" and not isinstance(points, dict):
-                if self.verbose:
-                    print(f"Applying reranking to {len(points)} results")
-                
-                points = SearchAlgorithms._rerank_results(query, points, processor, limit)
-            
-            # Check for errors
-            if isinstance(points, dict) and "error" in points:
-                return points
-                
-            # Format results with improved preview
-            return self._format_search_results(points, query, search_type, processor, context_size)
-            
-        except Exception as e:
-            print(f"Error during search: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return {"error": str(e)}
-
 
     def _format_search_results(self, points, query, search_type, processor, context_size=300):
         """Format search results with improved preview using TextProcessor"""
@@ -1381,135 +1454,6 @@ class QdrantManager(VectorDBInterface):
             db_type="qdrant"  # Pass the db_type
         )
 
-    def _create_smart_preview(self, text, query, context_size=300):
-        """
-        Create a preview with clear highlighting of searched terms.
-        
-        Using the implementation from TextProcessor.
-        """
-        return TextProcessor.create_smart_preview(text, query, context_size)
-
-    def _highlight_query_terms(self, text, query):
-        """
-        Highlight query terms in the text using bold markdown syntax.
-        
-        Using the implementation from TextProcessor.
-        """
-        return TextProcessor.highlight_query_terms(text, query)
-    
-    
-    def search_sparse(self, query: str, processor: Any, limit: int, score_threshold: float = None):
-        """
-        Perform a sparse vector search according to Qdrant documentation format
-        """
-        if processor is None:
-            return {"error": "Sparse search requires an embedding model"}
-        
-        # Get vector names
-        has_mlx_provider = (
-            processor is not None
-            and hasattr(processor, 'mlx_embedding_provider')
-            and processor.mlx_embedding_provider is not None
-        )
-        dense_model_id = getattr(processor, 'dense_model_id', self.dense_model_id)
-        sparse_model_id = getattr(processor, 'sparse_model_id', self.sparse_model_id)
-        _, sparse_vector_name = self._get_vector_names(dense_model_id, sparse_model_id)
-        
-        if self.verbose:
-            print(f"[DEBUG] Sparse search using vector name '{sparse_vector_name}'")
-
-        try:
-            # Generate sparse vector
-            if has_mlx_provider:
-                sparse_indices, sparse_values = processor.mlx_embedding_provider.get_sparse_embedding(query)
-            else:
-                sparse_indices, sparse_values = generate_sparse_vector(query)
-            
-            # Warn if this appears to be just a bag of words
-            if len(sparse_indices) < 5 or max(sparse_values) < 0.1:
-                print(f"⚠️ WARNING: Sparse vector appears to be low quality (possibly just a bag of words).")
-                print(f"This might significantly reduce search quality.")
-                
-            if self.verbose:
-                print(f"[DEBUG] Created sparse vector with {len(sparse_indices)} non-zero terms")
-                if len(sparse_indices) > 0:
-                    print(f"Sample indices: {sparse_indices[:5]}")
-                    print(f"Sample values: {sparse_values[:5]}")
-            
-            # Perform search according to Qdrant documentation format
-            try:
-                # Format the query according to Qdrant documentation
-                search_result = self.client.search(
-                    collection_name=self.collection_name,
-                    query_vector=(sparse_vector_name, {
-                        "indices": sparse_indices,
-                        "values": sparse_values
-                    }),
-                    limit=limit * 3,  # Get more results to filter later
-                    with_payload=True,
-                    score_threshold=score_threshold
-                )
-                
-                if self.verbose:
-                    print(f"[DEBUG] Sparse search returned {len(search_result)} results")
-                
-                return search_result
-                
-            except Exception as e:
-                if self.verbose:
-                    print(f"[ERROR] Standard sparse search failed: {e}")
-                    print("Trying alternative sparse search methods...")
-                
-                # Try with NamedSparseVector format (newer Qdrant versions)
-                try:
-                    from qdrant_client.models import NamedSparseVector, SparseVector
-                    search_result = self.client.search(
-                        collection_name=self.collection_name,
-                        query_vector=NamedSparseVector(
-                            name=sparse_vector_name,
-                            vector=SparseVector(
-                                indices=sparse_indices,
-                                values=sparse_values
-                            )
-                        ),
-                        limit=limit * 3,
-                        with_payload=True,
-                        score_threshold=score_threshold
-                    )
-                    
-                    if self.verbose:
-                        print(f"[DEBUG] Alternative sparse search returned {len(search_result)} results")
-                    
-                    return search_result
-                    
-                except Exception as e2:
-                    # Last resort - try with query_points
-                    try:
-                        from qdrant_client.models import SparseVector
-                        result = self.client.query_points(
-                            collection_name=self.collection_name,
-                            query=SparseVector(
-                                indices=sparse_indices,
-                                values=sparse_values
-                            ),
-                            using=sparse_vector_name,
-                            limit=limit * 3,
-                            with_payload=True,
-                            score_threshold=score_threshold
-                        )
-                        
-                        if self.verbose:
-                            print(f"[DEBUG] query_points sparse search returned {len(result.points)} results")
-                        
-                        return result.points
-                    except Exception as e3:
-                        return {"error": f"All sparse search methods failed: {e3}"}
-        
-        except Exception as e:
-            print(f"Error generating sparse vectors: {e}")
-            return SearchAlgorithms.handle_search_error("qdrant", "sparse", e, self.verbose)
-    
-        
     def cleanup(self, remove_storage=False):
         """Clean up resources"""
         # Close the client if it exists

@@ -123,7 +123,7 @@ def run_search(args):
     """Run search on the existing collection with modular database support"""
     
     # Get database type from arguments, defaulting to Qdrant
-    db_type = args.db_type
+    db_type = getattr(args, 'db-type', 'qdrant')
     
     # Import the factory
     from vector_db_interface import DBFactory
@@ -152,19 +152,19 @@ def run_search(args):
         })
     elif db_type.lower() == 'lancedb':
         db_args.update({
-            "uri": args.lancedb_uri,
+            "uri": getattr(args, 'lancedb-uri', None),
         })
     elif db_type.lower() == 'meilisearch':
         db_args.update({
-            "url": args.meilisearch_url,
-            "api_key": args.meilisearch_api_key,
+            "url": getattr(args, 'meilisearch-url', "http://localhost:7700"),
+            "api_key": getattr(args, 'meilisearch-api-key', None),
         })
     elif db_type.lower() == 'elasticsearch':
         db_args.update({
-            "hosts": args.es_hosts,
-            "api_key": args.es_api_key,
-            "username": args.es_username,
-            "password": args.es_password,
+            "hosts": getattr(args, 'es-hosts', ["http://localhost:9200"]),
+            "api_key": getattr(args, 'es-api-key', None),
+            "username": getattr(args, 'es-username', None),
+            "password": getattr(args, 'es-password', None),
         })
         
     # Create the database handler using the factory
@@ -188,6 +188,13 @@ def run_search(args):
         if args.verbose:
             print("\n====== Loading Models for Search ======")
             
+        # Custom model params
+        custom_repo_id = getattr(args, 'custom-repo-id', None)
+        custom_ndim = getattr(args, 'custom-ndim', None)
+        custom_pooling = getattr(args, 'custom-pooling', 'mean')
+        custom_normalize = getattr(args, 'custom-normalize', True)
+        custom_max_length = getattr(args, 'custom-max-length', 512)
+            
         # Initialize document processor with embedding models if available
         processor_args = {
             "model_name": args.model,
@@ -196,14 +203,14 @@ def run_search(args):
         }
         
         # Check for FastEmbed usage first (highest priority)
-        if args.use_fastembed:
+        if hasattr(args, 'use_fastembed') and args.use_fastembed:
             if HAS_FASTEMBED:
                 processor_args.update({
                     "use_fastembed": True,
-                    "fastembed_model": args.fastembed_model,
-                    "fastembed_sparse_model": args.fastembed_sparse_model,
-                    "fastembed_use_gpu": args.fastembed_use_gpu,
-                    "fastembed_cache_dir": args.fastembed_cache_dir
+                    "fastembed_model": getattr(args, 'fastembed_model', DEFAULT_FASTEMBED_MODEL),
+                    "fastembed_sparse_model": getattr(args, 'fastembed_sparse_model', DEFAULT_FASTEMBED_SPARSE_MODEL),
+                    "fastembed_use_gpu": getattr(args, 'fastembed_use_gpu', False),
+                    "fastembed_cache_dir": getattr(args, 'fastembed_cache_dir', None)
                 })
                 if args.verbose:
                     print(f"Using FastEmbed with model: {args.fastembed_model}")
@@ -212,12 +219,12 @@ def run_search(args):
                 print("Falling back to Ollama or MLX")
         
         # Check for Ollama usage second
-        elif args.use_ollama:
+        elif hasattr(args, 'use_ollama') and args.use_ollama:
             if HAS_OLLAMA:
                 processor_args.update({
                     "use_ollama": True,
-                    "ollama_model": args.ollama_model,
-                    "ollama_host": args.ollama_host
+                    "ollama_model": getattr(args, 'ollama_model', DEFAULT_OLLAMA_EMBED_MODEL),
+                    "ollama_host": getattr(args, 'ollama_host', "http://localhost:11434")
                 })
                 if args.verbose:
                     print(f"Using Ollama with model: {args.ollama_model}")
@@ -225,22 +232,22 @@ def run_search(args):
                 print("Warning: Ollama not available. Falling back to MLX or default models.")
         
         # Use MLX embedding models if available and neither FastEmbed nor Ollama used
-        if not processor_args.get("use_ollama", False) and args.use_mlx_models and HAS_MLX_EMBEDDING_MODELS:
+        if not processor_args.get("use_ollama", False) and hasattr(args, 'use_mlx_models') and HAS_MLX_EMBEDDING_MODELS and args.use_mlx_models:
             processor_args.update({
                 "use_mlx_embedding": True,
                 "dense_model": args.dense_model,
                 "sparse_model": args.sparse_model,
-                "top_k": args.top_k,
-                "custom_repo_id": args.custom_repo_id,
-                "custom_ndim": args.custom_ndim,
-                "custom_pooling": args.custom_pooling,
-                "custom_normalize": args.custom_normalize,
-                "custom_max_length": args.custom_max_length
+                "top_k": getattr(args, 'top-k', 64),
+                "custom_repo_id": custom_repo_id,
+                "custom_ndim": custom_ndim,
+                "custom_pooling": custom_pooling,
+                "custom_normalize": custom_normalize,
+                "custom_max_length": custom_max_length
             })
             
             if args.verbose:
-                if args.custom_repo_id:
-                    print(f"Using custom model: {args.custom_repo_id}")
+                if custom_repo_id:
+                    print(f"Using custom model: {custom_repo_id}")
                 else:
                     print(f"Using MLX embedding models: {args.dense_model} (dense), {args.sparse_model} (sparse)")
         
@@ -250,6 +257,13 @@ def run_search(args):
     if args.verbose:
         print(f"\n====== Running {args.search_type.capitalize()} Search on {db_type.capitalize()} ======")
     
+    # Read adjustment parameters from args
+    relevance_tuning = getattr(args, 'relevance_tuning', True)
+    context_size = getattr(args, 'context_size', 500)
+    score_threshold = getattr(args, 'score_threshold', None)
+    rerank = getattr(args, 'rerank', False)  # reranking parameter
+    reranker_type = getattr(args, 'reranker_type', None)  # Add reranker type parameter
+    
     # Use the search method from the database manager
     results = db_manager.search(
         query=args.query,
@@ -258,11 +272,11 @@ def run_search(args):
         processor=processor,
         prefetch_limit=args.prefetch_limit,
         fusion_type=args.fusion,
-        relevance_tuning=args.relevance_tuning,
-        context_size=args.context_size,
-        score_threshold=args.score_threshold,
-        rerank=args.rerank,
-        reranker_type=args.reranker_type
+        relevance_tuning=relevance_tuning,
+        context_size=context_size,
+        score_threshold=score_threshold,
+        rerank=rerank,
+        reranker_type=reranker_type
     )
     
     # 4. Display results 
@@ -271,7 +285,8 @@ def run_search(args):
         return
     
     # Use terminal colors if enabled
-    color_output = not args.no_color
+    show_debug = getattr(args, 'debug', False)
+    color_output = not getattr(args, 'no_color', False)
     
     if color_output:
         RESET = "\033[0m"
@@ -347,7 +362,7 @@ def run_indexing(args):
     """Main function to run the indexing process with modular database support"""
 
     # First check if the requested database backend is available
-    db_type = args.db_type
+    db_type = getattr(args, 'db-type', 'qdrant')
     
     # Import the factory and interface
     from vector_db_interface import DBFactory
@@ -363,15 +378,22 @@ def run_indexing(args):
     # 1. Download model if needed (only needed for fallback model)
     if args.verbose:
         print("\n====== STEP 1: Downloading Model (if needed) ======")
-        print(f"args.use_mlx_models: {args.use_mlx_models}, HAS_MLX_EMBEDDING_MODELS: {HAS_MLX_EMBEDDING_MODELS}.")
+        print(f"hasattr: {hasattr(args, 'use_mlx_models')}, args.use_mlx_models: {args.use_mlx_models}, HAS_MLX_EMBEDDING_MODELS: {HAS_MLX_EMBEDDING_MODELS}.")
         
     # Only download legacy model files if not using MLX embedding models
-    if not (args.use_mlx_models and HAS_MLX_EMBEDDING_MODELS):
+    if not (hasattr(args, 'use-mlx-models') and args.use_mlx_models and HAS_MLX_EMBEDDING_MODELS):
         ModelUtils.download_model_files(args.model, args.weights, args.verbose)
     
     # 2. Initialize document processor
     if args.verbose:
         print("\n====== STEP 2: Initializing Document Processor ======")
+    
+    # Custom model params - preserve hyphenated args!
+    custom_repo_id = getattr(args, 'custom-repo-id', None)
+    custom_ndim = getattr(args, 'custom-ndim', None)
+    custom_pooling = getattr(args, 'custom-pooling', 'mean')
+    custom_normalize = getattr(args, 'custom-normalize', True)
+    custom_max_length = getattr(args, 'custom-max-length', 512)
     
     # Base processor arguments
     processor_args = {
@@ -381,42 +403,42 @@ def run_indexing(args):
     }
     
     # Store the actual model ID for database (prioritize custom_repo_id if available)
-    effective_dense_model = args.custom_repo_id if args.custom_repo_id else args.dense_model
+    effective_dense_model = custom_repo_id if custom_repo_id else args.dense_model
     
     # Check for FastEmbed usage first (highest priority)
-    if args.use_fastembed:
+    if hasattr(args, 'use-fastembed') and args.use_fastembed:
         if HAS_FASTEMBED:
             processor_args.update({
                 "use_fastembed": True,
-                "fastembed_model": args.fastembed_model,
-                "fastembed_sparse_model": args.fastembed_sparse_model,
-                "fastembed_use_gpu": args.fastembed_use_gpu,
-                "fastembed_cache_dir": args.fastembed_cache_dir
+                "fastembed_model": getattr(args, 'fastembed-model', DEFAULT_FASTEMBED_MODEL),
+                "fastembed_sparse_model": getattr(args, 'fastembed-sparse-model', DEFAULT_FASTEMBED_SPARSE_MODEL),
+                "fastembed_use_gpu": getattr(args, 'fastembed-use-gpu', False),
+                "fastembed_cache_dir": getattr(args, 'fastembed-cache-dir', None)
             })
             if args.verbose:
-                print(f"Using FastEmbed with model: {args.fastembed_model}")
+                print(f"Using FastEmbed with model: {getattr(args, 'fastembed-model', DEFAULT_FASTEMBED_MODEL)}")
         else:
             print("Warning: FastEmbed not available. Install with: pip install fastembed")
             print("Falling back to Ollama or MLX")
     
     # Check for Ollama usage second
-    elif args.use_ollama:
+    elif hasattr(args, 'use-ollama') and args.use_ollama:
         if HAS_OLLAMA:
             processor_args.update({
                 "use_ollama": True,
-                "ollama_model": args.ollama_model,
-                "ollama_host": args.ollama_host
+                "ollama_model": getattr(args, 'ollama-model', DEFAULT_OLLAMA_EMBED_MODEL),
+                "ollama_host": getattr(args, 'ollama-host', "http://localhost:11434")
             })
             if args.verbose:
-                print(f"Using Ollama with model: {args.ollama_model}")
+                print(f"Using Ollama with model: {getattr(args, 'ollama-model', DEFAULT_OLLAMA_EMBED_MODEL)}")
         else:
             print("Warning: Ollama not available. Falling back to MLX or default models.")
     
     # Use MLX embedding models if available and neither FastEmbed nor Ollama used
-    if not processor_args.get("use_ollama", False) and args.use_mlx_models and HAS_MLX_EMBEDDING_MODELS:
+    if not processor_args.get("use_ollama", False) and hasattr(args, 'use-mlx-models') and args.use_mlx_models and HAS_MLX_EMBEDDING_MODELS:
         if args.verbose:
-            if args.custom_repo_id:
-                print(f"Using MLX embedding models with custom repository: {args.custom_repo_id}")
+            if custom_repo_id:
+                print(f"Using MLX embedding models with custom repository: {custom_repo_id}")
             else:
                 print(f"Using MLX with dense model: {args.dense_model}")
         
@@ -424,12 +446,12 @@ def run_indexing(args):
             "use_mlx_embedding": True,
             "dense_model": args.dense_model,
             "sparse_model": args.sparse_model,
-            "top_k": args.top_k,
-            "custom_repo_id": args.custom_repo_id,
-            "custom_ndim": args.custom_ndim,
-            "custom_pooling": args.custom_pooling,
-            "custom_normalize": args.custom_normalize,
-            "custom_max_length": args.custom_max_length
+            "top_k": getattr(args, 'top-k', 64),
+            "custom_repo_id": custom_repo_id,
+            "custom_ndim": custom_ndim,
+            "custom_pooling": custom_pooling,
+            "custom_normalize": custom_normalize,
+            "custom_max_length": custom_max_length
         })
     
     processor = TextProcessor(**processor_args)
@@ -463,19 +485,19 @@ def run_indexing(args):
             })
         elif db_type.lower() == 'lancedb':
             db_args.update({
-                "uri": args.lancedb_uri,
+                "uri": getattr(args, 'lancedb-uri', None),
             })
         elif db_type.lower() == 'meilisearch':
             db_args.update({
-                "url": args.meilisearch_url,
-                "api_key": args.meilisearch_api_key,
+                "url": getattr(args, 'meilisearch-url', "http://localhost:7700"),
+                "api_key": getattr(args, 'meilisearch-api-key', None),
             })
         elif db_type.lower() == 'elasticsearch':
             db_args.update({
-                "hosts": args.es_hosts,
-                "api_key": args.es_api_key,
-                "username": args.es_username,
-                "password": args.es_password,
+                "hosts": getattr(args, 'es-hosts', ["http://localhost:9200"]),
+                "api_key": getattr(args, 'es-api-key', None),
+                "username": getattr(args, 'es-username', None),
+                "password": getattr(args, 'es-password', None),
             })
             
         # Create the database handler using the factory
@@ -535,13 +557,13 @@ def run_indexing(args):
     else:
         file_iterator = files
     
-    # Determine whether to use regular or sparse processing
+    # Determine whether to use regular or sparse processing - PRESERVE HYPHENATED ARGS!
     use_sparse = (
-        args.use_mlx_models and hasattr(processor, 'mlx_embedding_provider')
+        hasattr(args, 'use-mlx-models') and args.use_mlx_models and hasattr(processor, 'mlx_embedding_provider')
     ) or (
-        args.use_fastembed and hasattr(processor, 'fastembed_provider')
+        hasattr(args, 'use-fastembed') and args.use_fastembed and hasattr(processor, 'fastembed_provider')
     ) or (
-        args.use_ollama and hasattr(processor, 'ollama_embedding_provider')
+        hasattr(args, 'use-ollama') and args.use_ollama and hasattr(processor, 'ollama_embedding_provider')
     )
     
     for file_path in file_iterator:
@@ -648,7 +670,6 @@ def main():
     """Main function with support for different vector database backends"""
     import argparse
     
-    # Create the main parser with consistent argument style
     parser = argparse.ArgumentParser(description="Enhanced Vector Database Indexer with Multiple Backend Support")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--storage-path", help="Path to store database data")
@@ -656,55 +677,43 @@ def main():
     # Add database selection option
     parser.add_argument("--db-type", choices=["qdrant", "lancedb", "meilisearch", "elasticsearch"], 
                         default="qdrant", help="Vector database backend to use")
-    
-    # Create embedding provider group with mutually exclusive options
+       
+    # Embedding provider group
     embedding_group = parser.add_argument_group("Embedding options")
     embedding_provider = embedding_group.add_mutually_exclusive_group()
-    embedding_provider.add_argument("--use-mlx-models", dest="use_mlx_models", action="store_true", 
-                                   help="Use mlx_embedding_models for embeddings")
-    embedding_provider.add_argument("--use-ollama", dest="use_ollama", action="store_true", 
-                                   help="Use Ollama for embeddings")
-    embedding_provider.add_argument("--use-fastembed", dest="use_fastembed", action="store_true", 
-                                   help="Use FastEmbed for embeddings")
+    embedding_provider.add_argument("--use-mlx-models", action="store_true", help="Use mlx_embedding_models for embeddings")
+    embedding_provider.add_argument("--use-ollama", action="store_true", help="Use Ollama for embeddings")
+    embedding_provider.add_argument("--use-fastembed", action="store_true", help="Use FastEmbed for embeddings")
     
     # MLX-specific arguments
     mlx_group = parser.add_argument_group("MLX embedding options")
-    mlx_group.add_argument("--dense-model", dest="dense_model", type=str, default="bge-small", 
-                          help="MLX dense embedding model name")
-    mlx_group.add_argument("--sparse-model", dest="sparse_model", type=str, default="distilbert-splade", 
-                          help="MLX sparse embedding model name")
-    mlx_group.add_argument("--top-k", dest="top_k", type=int, default=64, 
-                          help="Top-k tokens to keep in sparse vectors")
-    mlx_group.add_argument("--custom-repo-id", dest="custom_repo_id", type=str, 
-                          help="Custom model HuggingFace repo ID")
-    mlx_group.add_argument("--custom-ndim", dest="custom_ndim", type=int, 
-                          help="Custom model embedding dimension")
-    mlx_group.add_argument("--custom-pooling", dest="custom_pooling", type=str, 
-                          choices=["mean", "first", "max"], default="mean", 
+    mlx_group.add_argument("--dense-model", type=str, default="bge-small", help="MLX dense embedding model name")
+    mlx_group.add_argument("--sparse-model", type=str, default="distilbert-splade", help="MLX sparse embedding model name")
+    mlx_group.add_argument("--top-k", type=int, default=64, help="Top-k tokens to keep in sparse vectors")
+    mlx_group.add_argument("--custom-repo-id", type=str, help="Custom model HuggingFace repo ID")
+    mlx_group.add_argument("--custom-ndim", type=int, help="Custom model embedding dimension")
+    mlx_group.add_argument("--custom-pooling", type=str, choices=["mean", "first", "max"], default="mean", 
                           help="Custom model pooling strategy")
-    mlx_group.add_argument("--custom-normalize", dest="custom_normalize", action="store_true", default=True, 
-                          help="Normalize embeddings")
-    mlx_group.add_argument("--custom-max-length", dest="custom_max_length", type=int, default=512, 
-                          help="Custom model max sequence length")
+    mlx_group.add_argument("--custom-normalize", action="store_true", default=True, help="Normalize embeddings")
+    mlx_group.add_argument("--custom-max-length", type=int, default=512, help="Custom model max sequence length")
     
     # Ollama-specific arguments
     ollama_group = parser.add_argument_group("Ollama embedding options")
-    ollama_group.add_argument("--ollama-model", dest="ollama_model", type=str, default=DEFAULT_OLLAMA_EMBED_MODEL, 
+    ollama_group.add_argument("--ollama-model", type=str, default=DEFAULT_OLLAMA_EMBED_MODEL, 
                              help="Ollama model name for embeddings")
-    ollama_group.add_argument("--ollama-host", dest="ollama_host", type=str, default="http://localhost:11434", 
+    ollama_group.add_argument("--ollama-host", type=str, default="http://localhost:11434", 
                              help="Ollama API host URL")
     
     # FastEmbed-specific arguments
     fastembed_group = parser.add_argument_group("FastEmbed options")
-    fastembed_group.add_argument("--fastembed-model", dest="fastembed_model", type=str, default=DEFAULT_FASTEMBED_MODEL,
-                                help="FastEmbed model name for dense embeddings")
-    fastembed_group.add_argument("--fastembed-sparse-model", dest="fastembed_sparse_model", type=str, 
-                                default=DEFAULT_FASTEMBED_SPARSE_MODEL,
-                                help="FastEmbed model name for sparse embeddings")
-    fastembed_group.add_argument("--fastembed-use-gpu", dest="fastembed_use_gpu", action="store_true",
-                                help="Use GPU with FastEmbed (requires fastembed-gpu package)")
-    fastembed_group.add_argument("--fastembed-cache-dir", dest="fastembed_cache_dir", type=str,
-                                help="Directory to cache FastEmbed models")
+    fastembed_group.add_argument("--fastembed-model", type=str, default=DEFAULT_FASTEMBED_MODEL,
+                               help="FastEmbed model name for dense embeddings")
+    fastembed_group.add_argument("--fastembed-sparse-model", type=str, default=DEFAULT_FASTEMBED_SPARSE_MODEL,
+                               help="FastEmbed model name for sparse embeddings")
+    fastembed_group.add_argument("--fastembed-use-gpu", action="store_true",
+                               help="Use GPU with FastEmbed (requires fastembed-gpu package)")
+    fastembed_group.add_argument("--fastembed-cache-dir", type=str,
+                               help="Directory to cache FastEmbed models")
     
     # Add subparsers for commands
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -716,13 +725,37 @@ def main():
     index_parser.add_argument("--limit", type=int, help="Maximum number of files to index")
     index_parser.add_argument("--collection", type=str, default="documents", help="Collection name")
     index_parser.add_argument("--model", type=str, default="cstr/paraphrase-multilingual-MiniLM-L12-v2-mlx", 
-                             help="Hugging Face model name (fallback)")
+                            help="Hugging Face model name (fallback)")
     index_parser.add_argument("--weights", type=str, default="weights/paraphrase-multilingual-MiniLM-L12-v2.npz", 
-                             help="Path to store/load MLX weights (fallback)")
+                            help="Path to store/load MLX weights (fallback)")
     index_parser.add_argument("--recreate", action="store_true", help="Recreate collection if it exists")
     
-    # Don't duplicate these args since they're already in the parent parser
-    # Just ensure the index_parser gets a reference to them when needed
+    # MLX-specific arguments for index
+    index_parser.add_argument("--dense-model", type=str, default="bge-small", help="MLX dense embedding model name")
+    index_parser.add_argument("--sparse-model", type=str, default="distilbert-splade", help="MLX sparse embedding model name")
+    index_parser.add_argument("--top-k", type=int, default=64, help="Top-k tokens to keep in sparse vectors")
+    index_parser.add_argument("--custom-repo-id", type=str, help="Custom model HuggingFace repo ID")
+    index_parser.add_argument("--custom-ndim", type=int, help="Custom model embedding dimension")
+    index_parser.add_argument("--custom-pooling", type=str, choices=["mean", "first", "max"], default="mean", 
+                             help="Custom model pooling strategy")
+    index_parser.add_argument("--custom-normalize", action="store_true", default=True, help="Normalize embeddings")
+    index_parser.add_argument("--custom-max-length", type=int, default=512, help="Custom model max sequence length")
+    
+    # Ollama-specific arguments for index
+    index_parser.add_argument("--ollama-model", type=str, default=DEFAULT_OLLAMA_EMBED_MODEL, 
+                             help="Ollama model name for embeddings")
+    index_parser.add_argument("--ollama-host", type=str, default="http://localhost:11434", 
+                             help="Ollama API host URL")
+    
+    # FastEmbed-specific arguments for index
+    index_parser.add_argument("--fastembed-model", type=str, default=DEFAULT_FASTEMBED_MODEL,
+                            help="FastEmbed model name for dense embeddings")
+    index_parser.add_argument("--fastembed-sparse-model", type=str, default=DEFAULT_FASTEMBED_SPARSE_MODEL,
+                            help="FastEmbed model name for sparse embeddings")
+    index_parser.add_argument("--fastembed-use-gpu", action="store_true",
+                            help="Use GPU with FastEmbed (requires fastembed-gpu package)")
+    index_parser.add_argument("--fastembed-cache-dir", type=str,
+                            help="Directory to cache FastEmbed models")
 
     # Add database-specific parameters for Qdrant
     qdrant_group = index_parser.add_argument_group("Qdrant options")
@@ -731,58 +764,78 @@ def main():
     
     # Add database-specific parameters for LanceDB
     lancedb_group = index_parser.add_argument_group("LanceDB options")
-    lancedb_group.add_argument("--lancedb-uri", dest="lancedb_uri", type=str, 
-                              help="LanceDB URI (if not using local storage)")
+    lancedb_group.add_argument("--lancedb-uri", type=str, help="LanceDB URI (if not using local storage)")
     
     # Add database-specific parameters for Meilisearch
     meilisearch_group = index_parser.add_argument_group("Meilisearch options")
-    meilisearch_group.add_argument("--meilisearch-url", dest="meilisearch_url", type=str, 
-                                  default="http://localhost:7700", help="Meilisearch URL")
-    meilisearch_group.add_argument("--meilisearch-api-key", dest="meilisearch_api_key", type=str, 
-                                  help="Meilisearch API key")
+    meilisearch_group.add_argument("--meilisearch-url", type=str, default="http://localhost:7700", 
+                                 help="Meilisearch URL")
+    meilisearch_group.add_argument("--meilisearch-api-key", type=str, help="Meilisearch API key")
     
     # Add database-specific parameters for Elasticsearch
     es_group = index_parser.add_argument_group("Elasticsearch options")
-    es_group.add_argument("--es-hosts", dest="es_hosts", type=str, nargs="+", 
-                         default=["http://localhost:9200"], help="Elasticsearch hosts")
-    es_group.add_argument("--es-api-key", dest="es_api_key", type=str, help="Elasticsearch API key")
-    es_group.add_argument("--es-username", dest="es_username", type=str, help="Elasticsearch username")
-    es_group.add_argument("--es-password", dest="es_password", type=str, help="Elasticsearch password")
+    es_group.add_argument("--es-hosts", type=str, nargs="+", default=["http://localhost:9200"], 
+                        help="Elasticsearch hosts")
+    es_group.add_argument("--es-api-key", type=str, help="Elasticsearch API key")
+    es_group.add_argument("--es-username", type=str, help="Elasticsearch username")
+    es_group.add_argument("--es-password", type=str, help="Elasticsearch password")
     
-    # Search command
+        # Search command
     search_parser = subparsers.add_parser("search", help="Search documents")
     search_parser.add_argument("query", help="Search query")
-    search_parser.add_argument("--search-type", dest="search_type", choices=["keyword", "vector", "sparse", "hybrid"], 
-                              default="hybrid", help="Type of search to perform")
+    search_parser.add_argument("--search-type", choices=["keyword", "vector", "sparse", "hybrid"], default="hybrid", 
+                            help="Type of search to perform")
     search_parser.add_argument("--limit", type=int, default=10, help="Maximum number of results to return")
     search_parser.add_argument("--collection", type=str, default="documents", help="Collection name")
     search_parser.add_argument("--model", type=str, default="cstr/paraphrase-multilingual-MiniLM-L12-v2-mlx", 
-                              help="Hugging Face model name (fallback)")
+                            help="Hugging Face model name (fallback)")
     search_parser.add_argument("--weights", type=str, default="weights/paraphrase-multilingual-MiniLM-L12-v2.npz", 
-                              help="Path to MLX weights (fallback)")
-    search_parser.add_argument("--prefetch-limit", dest="prefetch_limit", type=int, default=50, 
-                              help="Prefetch limit for hybrid search")
+                            help="Path to MLX weights (fallback)")
+    search_parser.add_argument("--prefetch-limit", type=int, default=50, help="Prefetch limit for hybrid search")
     search_parser.add_argument("--fusion", choices=["rrf", "dbsf", "linear"], default="rrf", 
-                              help="Fusion strategy for hybrid search")
-    search_parser.add_argument("--relevance-tuning", dest="relevance_tuning", action="store_true", default=True, 
-                              help="Apply relevance tuning to hybrid search")
-    search_parser.add_argument("--context-size", dest="context_size", type=int, default=300, 
-                              help="Size of context window for preview text")
-    search_parser.add_argument("--score-threshold", dest="score_threshold", type=float,
-                              help="Minimum score threshold for results (0.0-1.0)")
+                            help="Fusion strategy for hybrid search")
+    search_parser.add_argument("--relevance-tuning", action="store_true", default=True, 
+                            help="Apply relevance tuning to hybrid search")
+    search_parser.add_argument("--context-size", type=int, default=300, 
+                            help="Size of context window for preview text")
+    search_parser.add_argument("--score-threshold", type=float,
+                            help="Minimum score threshold for results (0.0-1.0)")
     search_parser.add_argument("--debug", action="store_true", 
-                              help="Show detailed debug information")
-    search_parser.add_argument("--no-color", dest="no_color", action="store_true", 
-                              help="Disable colored output")
+                            help="Show detailed debug information")
+    search_parser.add_argument("--no-color", action="store_true", 
+                            help="Disable colored output")
     search_parser.add_argument("--rerank", action="store_true",
-                              help="Apply reranking to improve result quality")
-    search_parser.add_argument("--reranker-type", dest="reranker_type", 
-                              choices=["cross", "colbert", "cohere", "jina", "rrf", "linear"], 
-                              help="Type of reranker to use")
+                            help="Apply reranking to improve result quality")
+    search_parser.add_argument("--reranker-type", choices=["cross", "colbert", "cohere", "jina", "rrf", "linear"], 
+                            help="Type of reranker to use")
 
-    # Don't duplicate these args since they're already in the parent parser
-    # Just ensure the search_parser gets a reference to them when needed
-
+    # MLX-specific arguments for search
+    search_parser.add_argument("--dense-model", type=str, default="bge-small", help="MLX dense embedding model name")
+    search_parser.add_argument("--sparse-model", type=str, default="distilbert-splade", help="MLX sparse embedding model name")
+    search_parser.add_argument("--top-k", type=int, default=64, help="Top-k tokens for sparse vectors")
+    search_parser.add_argument("--custom-repo-id", type=str, help="Custom model HuggingFace repo ID")
+    search_parser.add_argument("--custom-ndim", type=int, help="Custom model embedding dimension")
+    search_parser.add_argument("--custom-pooling", type=str, choices=["mean", "first", "max"], default="mean", 
+                             help="Custom model pooling strategy")
+    search_parser.add_argument("--custom-normalize", action="store_true", default=True, help="Normalize embeddings")
+    search_parser.add_argument("--custom-max-length", type=int, default=512, help="Custom model max sequence length")
+    
+    # Ollama-specific arguments for search
+    search_parser.add_argument("--ollama-model", type=str, default=DEFAULT_OLLAMA_EMBED_MODEL, 
+                             help="Ollama model name for embeddings")
+    search_parser.add_argument("--ollama-host", type=str, default="http://localhost:11434", 
+                             help="Ollama API host URL")
+    
+    # FastEmbed-specific arguments for search
+    search_parser.add_argument("--fastembed-model", type=str, default=DEFAULT_FASTEMBED_MODEL,
+                            help="FastEmbed model name for dense embeddings")
+    search_parser.add_argument("--fastembed-sparse-model", type=str, default=DEFAULT_FASTEMBED_SPARSE_MODEL,
+                            help="FastEmbed model name for sparse embeddings")
+    search_parser.add_argument("--fastembed-use-gpu", action="store_true",
+                            help="Use GPU with FastEmbed (requires fastembed-gpu package)")
+    search_parser.add_argument("--fastembed-cache-dir", type=str,
+                            help="Directory to cache FastEmbed models")
+    
     # Add database-specific parameters for search with Qdrant
     qdrant_search_group = search_parser.add_argument_group("Qdrant options")
     qdrant_search_group.add_argument("--host", type=str, default="localhost", help="Qdrant host")
@@ -790,23 +843,21 @@ def main():
     
     # Add database-specific parameters for search with LanceDB
     lancedb_search_group = search_parser.add_argument_group("LanceDB options")
-    lancedb_search_group.add_argument("--lancedb-uri", dest="lancedb_uri", type=str, 
-                                     help="LanceDB URI (if not using local storage)")
+    lancedb_search_group.add_argument("--lancedb-uri", type=str, help="LanceDB URI (if not using local storage)")
     
     # Add database-specific parameters for search with Meilisearch
     meilisearch_search_group = search_parser.add_argument_group("Meilisearch options")
-    meilisearch_search_group.add_argument("--meilisearch-url", dest="meilisearch_url", type=str, 
-                                         default="http://localhost:7700", help="Meilisearch URL")
-    meilisearch_search_group.add_argument("--meilisearch-api-key", dest="meilisearch_api_key", type=str, 
-                                         help="Meilisearch API key")
+    meilisearch_search_group.add_argument("--meilisearch-url", type=str, default="http://localhost:7700", 
+                                       help="Meilisearch URL")
+    meilisearch_search_group.add_argument("--meilisearch-api-key", type=str, help="Meilisearch API key")
     
     # Add database-specific parameters for search with Elasticsearch
     es_search_group = search_parser.add_argument_group("Elasticsearch options")
-    es_search_group.add_argument("--es-hosts", dest="es_hosts", type=str, nargs="+", 
-                                default=["http://localhost:9200"], help="Elasticsearch hosts")
-    es_search_group.add_argument("--es-api-key", dest="es_api_key", type=str, help="Elasticsearch API key")
-    es_search_group.add_argument("--es-username", dest="es_username", type=str, help="Elasticsearch username")
-    es_search_group.add_argument("--es-password", dest="es_password", type=str, help="Elasticsearch password")
+    es_search_group.add_argument("--es-hosts", type=str, nargs="+", default=["http://localhost:9200"], 
+                              help="Elasticsearch hosts")
+    es_search_group.add_argument("--es-api-key", type=str, help="Elasticsearch API key")
+    es_search_group.add_argument("--es-username", type=str, help="Elasticsearch username")
+    es_search_group.add_argument("--es-password", type=str, help="Elasticsearch password")
     
     # List models command
     list_parser = subparsers.add_parser("list-models", help="List available MLX embedding models")
@@ -816,13 +867,11 @@ def main():
 
     args = parser.parse_args()
 
-    if args.verbose:
-        print(f"Command: {args.command}")
-        print(f"Arguments: {args}")
-        print("\n====== Checking MLX Embedding Models Compatibility ======")
-        GeneralUtils.check_mlx_embedding_compatibility()
-        print("========================================================\n")
+    print ("args:", args)
 
+    missing_deps = []
+    is_available = []
+    
     if args.command == "index":
         is_available, missing_deps = GeneralUtils.check_db_dependencies(args.db_type)
         if not is_available:
@@ -876,7 +925,7 @@ def main():
             
         run_search(args)
     
-    elif args.command == "list-models":
+    if args.command == "list-models":
         models_available = False
         
         # List FastEmbed models if available
@@ -916,6 +965,8 @@ def main():
                 normalize = "Yes" if info.get("normalize", False) else "No"
                 max_length = info.get("max_length", "unknown")
                 print(f"{i+1:2d}. {model_name:30s} - Dim: {dim:4d}, Normalize: {normalize}, Max Length: {max_length}")
+                
+            # [Rest of Ollama model listing code remains the same]
         
         # List MLX models if available
         if HAS_MLX_EMBEDDING_MODELS:

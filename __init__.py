@@ -3,7 +3,7 @@ Enhanced Vector Database indexer with support for multiple backends.
 
 This module provides support for:
 - Qdrant
-- LanceDB (in development)
+- LanceDB
 - Meilisearch (planned)
 - Elasticsearch (planned)
 
@@ -35,21 +35,24 @@ AVAILABLE_DBS = {
 try:
     from lancedb_manager import LanceDBManager
     AVAILABLE_DBS["lancedb"] = LanceDBManager
-    __all__.append('LanceDBManager')
+    if "__all__" in globals():
+        __all__.append('LanceDBManager')
 except ImportError:
     pass
 
 try:
     from meilisearch_manager import MeilisearchManager
     AVAILABLE_DBS["meilisearch"] = MeilisearchManager
-    __all__.append('MeilisearchManager')
+    if "__all__" in globals():
+        __all__.append('MeilisearchManager')
 except ImportError:
     pass
 
 try:
     from elasticsearch_manager import ElasticsearchManager
     AVAILABLE_DBS["elasticsearch"] = ElasticsearchManager
-    __all__.append('ElasticsearchManager')
+    if "__all__" in globals():
+        __all__.append('ElasticsearchManager')
 except ImportError:
     pass
 
