@@ -21,7 +21,6 @@ except ImportError:
     meilisearch_available = False
     print("Warning: Meilisearch client not available. Install with: pip install meilisearch")
 
-
 class MeilisearchManager(VectorDBInterface):
     """Manager for Meilisearch vector database operations with semantic search capabilities"""
     
@@ -63,10 +62,135 @@ class MeilisearchManager(VectorDBInterface):
         self.dense_model_id = dense_model_id
         self.sparse_model_id = sparse_model_id
         
+        # Create dictionary for tracking embedder name mappings
+        # This is crucial for maintaining consistency across operations
+        self.embedder_name_map = {}
+        
         # Performance tracking
         self._hit_rates = {}
         
+        # Initialize name map with default model IDs
+        self._register_embedder_name(self.dense_model_id)
+        
         self.connect()
+
+    def _register_embedder_name(self, model_id):
+        """
+        Register a model ID and generate its standardized embedder name.
+        Store in the mapping dictionary for consistent reference.
+        
+        Args:
+            model_id: The model identifier to register
+            
+        Returns:
+            The standardized embedder name for this model ID
+        """
+        if model_id in self.embedder_name_map:
+            return self.embedder_name_map[model_id]
+            
+        # Extract just the final part of the model name if it has slashes
+        if "/" in model_id:
+            model_base = model_id.split("/")[-1]
+        else:
+            model_base = model_id
+            
+        # Sanitize the base name for use as an embedder name
+        embedder_name = re.sub(r'[^a-zA-Z0-9]', '_', model_base)
+        
+        # Ensure name doesn't exceed reasonable length
+        max_name_length = 40
+        if len(embedder_name) > max_name_length:
+            embedder_name = embedder_name[:max_name_length]
+            
+        # Add prefix to make it clear this is a dense embedder
+        embedder_name = f"dense_{embedder_name}"
+        
+        # Store mapping for future reference
+        self.embedder_name_map[model_id] = embedder_name
+        
+        if self.verbose:
+            print(f"Registered model ID '{model_id}' with embedder name '{embedder_name}'")
+            
+        return embedder_name
+        
+    def get_collection_info(self) -> Dict[str, Any]:
+        """Get information about the collection including vector configurations"""
+        try:
+            if not self.client:
+                return {"error": "Not connected to Meilisearch"}
+                
+            collection_info = {}
+            
+            try:
+                # Get index stats
+                stats = self.index.get_stats()
+                
+                # Extract document count
+                doc_count = 0
+                if hasattr(stats, "number_of_documents"):
+                    doc_count = stats.number_of_documents
+                elif isinstance(stats, dict) and "numberOfDocuments" in stats:
+                    doc_count = stats["numberOfDocuments"]
+                    
+                collection_info["points_count"] = doc_count
+                
+                # Get embedders information
+                embedders = self._get_existing_embedders()
+                
+                # Format vector configurations
+                vector_configs = {}
+                for name, config in embedders.items():
+                    vector_configs[name] = {
+                        "dimensions": config.get("dimensions", 0),
+                        "source": config.get("source", "unknown")
+                    }
+                    
+                collection_info["vector_configs"] = vector_configs
+                
+                # Sparse vectors are simulated in Meilisearch
+                collection_info["sparse_vector_configs"] = {}
+                
+                # Add embedder name mapping
+                collection_info["embedder_name_map"] = self.embedder_name_map
+                
+                # Include performance data if available
+                if hasattr(self, '_hit_rates') and self._hit_rates:
+                    collection_info["performance"] = {"hit_rates": self._hit_rates}
+                
+                return collection_info
+                
+            except Exception as e:
+                if self.verbose:
+                    print(f"Error getting collection info: {e}")
+                return {"error": f"Error getting collection info: {str(e)}"}
+                
+        except Exception as e:
+            if self.verbose:
+                print(f"Error in get_collection_info: {e}")
+            return {"error": str(e)}
+        
+    def get_embedder_name(self, model_id=None):
+        """
+        Get the standardized embedder name for a model ID, creating it if needed.
+        
+        Args:
+            model_id: Model ID to get embedder name for (default: self.dense_model_id)
+            
+        Returns:
+            Standardized embedder name
+        """
+        model_id = model_id or self.dense_model_id
+        
+        # Check if we already have a mapping
+        if model_id in self.embedder_name_map:
+            embedder_name = self.embedder_name_map[model_id]
+            if self.verbose:
+                print(f"Using existing embedder name '{embedder_name}' for model '{model_id}'")
+            return embedder_name
+            
+        # Create new mapping
+        embedder_name = self._register_embedder_name(model_id)
+        return embedder_name
 
     def connect(self) -> None:
         """Connect to Meilisearch server"""
@@ -106,11 +230,61 @@ class MeilisearchManager(VectorDBInterface):
             print(f"Error connecting to Meilisearch: {str(e)}")
             raise
 
+    def _get_existing_embedders(self):
+        """
+        Get the existing embedders configuration from the Meilisearch index.
+        
+        Returns:
+            Dictionary of embedder configurations, or empty dict if no embedders exist
+        """
+        try:
+            # Try different methods to get embedders configuration
+            embedders = {}
+            
+            # Method 1: Direct method call (newer client)
+            try:
+                embedders = self.index.get_embedders()
+                # Convert object to dict if needed
+                if embedders and not isinstance(embedders, dict):
+                    embedders = {name: {"dimensions": config.dimensions, "source": config.source} 
+                               for name, config in embedders.items()}
+            except AttributeError:
+                # Method 2: REST API call (fallback for older clients)
+                if self.verbose:
+                    print("Falling back to REST API to get embedders")
+                try:
+                    import requests
+                    response = requests.get(
+                        f"{self.url}/indexes/{self.collection_name}/settings/embedders",
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}" if self.api_key else None
+                        }
+                    )
+                    
+                    if response.status_code == 200:
+                        embedders = response.json()
+                except Exception as rest_err:
+                    if self.verbose:
+                        print(f"Error with REST API call: {rest_err}")
+            
+            if self.verbose:
+                if embedders:
+                    print(f"Found {len(embedders)} existing embedders:")
+                    for name, config in embedders.items():
+                        print(f"  - {name}: {config}")
+                else:
+                    print("No existing embedders found")
+                    
+            return embedders
+        except Exception as e:
+            if self.verbose:
+                print(f"Error getting existing embedders: {e}")
+            return {}
 
     def create_collection(self, recreate: bool = False) -> None:
         """Create Meilisearch index with vector search capabilities"""
         try:
-            # Check if the index already exists (using more robust approach)
+            # Check if the index already exists
             exists = False
             try:
                 # Directly try to get the index
@@ -169,7 +343,8 @@ class MeilisearchManager(VectorDBInterface):
                     'content', 
                     'path', 
                     'filename',
-                    'sparse_terms'  # For sparse vector simulation
+                    'sparse_terms',  # For sparse vector simulation
+                    'text'           # Add 'text' attribute to searchable attributes
                 ],
                 'filterableAttributes': [
                     'fileType', 
@@ -189,7 +364,6 @@ class MeilisearchManager(VectorDBInterface):
                     'modifiedAt', 
                     'chunk_index'
                 ],
-                # Use the exact ranking rules from the working implementation
                 'rankingRules': [
                     'words',
                     'typo',
@@ -206,27 +380,35 @@ class MeilisearchManager(VectorDBInterface):
             
             # Configure vector settings for Meilisearch if we have the vector dimension
             if self.vector_dim > 0:
-                # Create a unique vector name based on the model ID
-                vector_name = self._sanitize_model_name(self.dense_model_id)
+                # Get default embedder name for the primary model - always using "default" for simplicity
+                primary_embedder_name = "default"
                 
-                # Configure the embedder
-                try:
-                    # Use correct embedder configuration parameters
-                    embedder_settings = {
-                        vector_name: {
-                            'source': 'ollama',
-                            'url': 'http://localhost:11434/api/embeddings',
-                            'model': self.dense_model_id,
-                            'documentTemplate': '{{doc.content}}'  # Properly formatted for Ollama
-                        }
+                # First, check for existing embedders
+                existing_embedders = self._get_existing_embedders()
+                
+                if self.verbose:
+                    print(f"Current embedders: {existing_embedders}")
+                
+                # Create the proper embedder configuration
+                # CRITICAL: In Meilisearch v1.6+, user-provided embedders MUST use the 'userProvided' source
+                embedder_settings = {
+                    primary_embedder_name: {
+                        'source': 'userProvided',
+                        'dimensions': self.vector_dim
                     }
+                }
+                
+                if self.verbose:
+                    print(f"Configuring embedder with settings: {embedder_settings}")
                     
+                # Update embedders with clear error handling
+                try:
+                    # Try the dedicated method first (newer Meilisearch versions)
                     try:
-                        # Try the dedicated method first (newer Meilisearch versions)
                         task = self.index.update_embedders(embedder_settings)
                         self._wait_for_task(task)
                         if self.verbose:
-                            print(f"Vector search enabled with {self.vector_dim} dimensions using embedder: {self.dense_model_id}")
+                            print(f"Vector search enabled with {self.vector_dim} dimensions using embedder: {primary_embedder_name}")
                     except AttributeError:
                         # Fall back to direct API call for older clients
                         import requests
@@ -254,6 +436,42 @@ class MeilisearchManager(VectorDBInterface):
         except Exception as e:
             print(f"Error creating collection: {str(e)}")
             raise
+    
+    def _update_embedders(self, embedder_settings):
+        """
+        Update embedders with robust error handling and multiple approaches.
+        
+        Args:
+            embedder_settings: Dictionary of embedder configurations to add/update
+        """
+        if self.verbose:
+            print(f"Updating embedders with: {embedder_settings}")
+            
+        try:
+            # Try the dedicated method first (newer Meilisearch versions)
+            task = self.index.update_embedders(embedder_settings)
+            self._wait_for_task(task)
+            if self.verbose:
+                print(f"Vector search enabled successfully using update_embedders method")
+        except AttributeError:
+            # Fall back to direct API call for older clients
+            import requests
+            response = requests.patch(
+                f"{self.url}/indexes/{self.collection_name}/settings/embedders",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}" if self.api_key else None
+                },
+                json=embedder_settings
+            )
+            
+            if response.status_code == 202:
+                if self.verbose:
+                    print(f"Vector search enabled via REST API")
+            else:
+                raise Exception(f"Failed to enable vector search via REST API: {response.text}")
+        except Exception as e:
+            raise Exception(f"Error updating embedders: {e}")
     
     def _wait_for_task(self, task):
         """Wait for a Meilisearch task to complete"""
@@ -329,347 +547,319 @@ class MeilisearchManager(VectorDBInterface):
         except Exception as e:
             if self.verbose:
                 print(f"Error waiting for task: {e}")
-    
-    def _sanitize_model_name(self, model_name):
-        """Sanitize model name for use as a vector name in Meilisearch"""
-        # Extract just the final part of the model name if it has slashes
-        if "/" in model_name:
-            model_name = model_name.split("/")[-1]
-            
-        # Replace any non-alphanumeric characters with underscores
-        sanitized = re.sub(r'[^a-zA-Z0-9]', '_', model_name)
-        
-        # Ensure the name isn't too long
-        if len(sanitized) > 40:
-            sanitized = sanitized[:40]
-            
-        return sanitized
-    
-    def get_collection_info(self) -> Dict[str, Any]:
-        try:
-            if not self.client or not self.index:
-                return {"error": "Not connected to Meilisearch or index not found"}
-                
-            # Get index stats
-            try:
-                # Get stats object
-                stats = self.index.get_stats()
-                
-                # Handle both dictionary and object response format
-                # Modern Meilisearch clients return objects, older ones return dictionaries
-                num_docs = 0
-                num_embedded_docs = 0
-                num_embeddings = 0
-                field_distribution = {}
-                is_indexing = False
-                
-                if isinstance(stats, dict):
-                    # Dictionary response (older client)
-                    num_docs = stats.get("numberOfDocuments", 0)
-                    num_embedded_docs = stats.get("numberOfEmbeddedDocuments", 0)
-                    num_embeddings = stats.get("numberOfEmbeddings", 0)
-                    field_distribution = stats.get("fieldDistribution", {})
-                    is_indexing = stats.get("isIndexing", False)
-                else:
-                    # Object response (newer client)
-                    num_docs = getattr(stats, "number_of_documents", 0)
-                    num_embedded_docs = getattr(stats, "number_of_embedded_documents", 0)
-                    num_embeddings = getattr(stats, "number_of_embeddings", 0)
-                    field_distribution = getattr(stats, "field_distribution", {})
-                    is_indexing = getattr(stats, "is_indexing", False)
-                
-                # Get index info including primary key
-                index_info = {}
-                try:
-                    index_info_resp = self.client.get_index(self.collection_name)
-                    if isinstance(index_info_resp, dict):
-                        index_info = index_info_resp
-                    else:
-                        # Convert object to dictionary
-                        index_info = {
-                            "uid": getattr(index_info_resp, "uid", self.collection_name),
-                            "primaryKey": getattr(index_info_resp, "primary_key", "id"),
-                            "createdAt": getattr(index_info_resp, "created_at", None),
-                            "updatedAt": getattr(index_info_resp, "updated_at", None)
-                        }
-                except Exception as e:
-                    if self.verbose:
-                        print(f"Error getting index info: {e}")
-                    index_info = {"primaryKey": "id"}  # Default
-                
-                # Check for embedder settings (vector search)
-                vector_configs = {}
-                try:
-                    # Try different ways to access embedder settings
-                    embedders = None
-                    
-                    # Method 1: Direct method call (newer client)
-                    try:
-                        embedders = self.index.get_embedders()
-                        # Convert to dictionary if it's an object
-                        if embedders and not isinstance(embedders, dict):
-                            embedders = {name: {"model": config.model, "source": config.source} 
-                                        for name, config in embedders.items()}
-                    except AttributeError:
-                        pass
-                    
-                    # Method 2: REST API call (fallback for older clients)
-                    if not embedders:
-                        try:
-                            import requests
-                            response = requests.get(
-                                f"{self.url}/indexes/{self.collection_name}/settings/embedders",
-                                headers={
-                                    "Authorization": f"Bearer {self.api_key}" if self.api_key else None
-                                }
-                            )
-                            
-                            if response.status_code == 200:
-                                embedders = response.json()
-                        except Exception as rest_err:
-                            if self.verbose:
-                                print(f"Error with REST API call: {rest_err}")
-                    
-                    # Process embedders if found
-                    if embedders and isinstance(embedders, dict):
-                        for name, config in embedders.items():
-                            if isinstance(config, dict):
-                                vector_configs[name] = {
-                                    "model": config.get("model", "unknown"),
-                                    "source": config.get("source", "unknown")
-                                }
-                            else:
-                                # Handle object config
-                                vector_configs[name] = {
-                                    "model": getattr(config, "model", "unknown"),
-                                    "source": getattr(config, "source", "unknown")
-                                }
-                except Exception as e:
-                    if self.verbose:
-                        print(f"Error getting embedder settings: {e}")
-                
-                # Construct result with comprehensive stats
-                result = {
-                    "name": self.collection_name,
-                    "points_count": num_docs,
-                    "embedded_docs_count": num_embedded_docs,
-                    "embeddings_count": num_embeddings,
-                    "is_indexing": is_indexing,
-                    "field_distribution": field_distribution,
-                    "vector_configs": vector_configs,
-                    "sparse_vector_configs": {},  # Meilisearch doesn't have separate sparse configs
-                    "primaryKey": index_info.get("primaryKey", "id")
-                }
-                
-                # Include performance data if available
-                if hasattr(self, '_hit_rates') and self._hit_rates:
-                    result["performance"] = {"hit_rates": self._hit_rates}
-                
-                return result
-            except Exception as e:
-                return {"error": f"Error getting index info: {str(e)}"}
-                
-        except Exception as e:
-            if self.verbose:
-                print(f"Error in get_collection_info: {e}")
-            return {"error": str(e)}
-    
-    def _record_hit(self, search_type: str, hit: bool):
-        """Record hit for performance tracking"""
-        if not hasattr(self, '_hit_rates'):
-            self._hit_rates = {}
-            
-        if search_type not in self._hit_rates:
-            self._hit_rates[search_type] = {"hits": 0, "total": 0}
-            
-        self._hit_rates[search_type]["total"] += 1
-        if hit:
-            self._hit_rates[search_type]["hits"] += 1
-    
-    def get_hit_rates(self) -> Dict[str, float]:
-        """Get hit rates for different search types"""
-        if not hasattr(self, '_hit_rates'):
-            return {}
-            
-        result = {}
-        for search_type, stats in self._hit_rates.items():
-            if stats["total"] > 0:
-                hit_rate = stats["hits"] / stats["total"]
-                result[search_type] = hit_rate
-        return result
-        
-    def _extract_document_count_from_stats(self, stats):
-        """
-        Safely extract document count from stats object or dictionary.
-        """
-        try:
-            # For dictionary responses (most common)
-            if isinstance(stats, dict):
-                if "numberOfDocuments" in stats:
-                    return stats["numberOfDocuments"]
-                if "number_of_documents" in stats:
-                    return stats["number_of_documents"]
-                return 0
-                
-            # For object responses - this seems to be our case
-            if hasattr(stats, "number_of_documents"):
-                return getattr(stats, "number_of_documents")
-                
-            # Print debug info about the stats object structure
-            if self.verbose:
-                print(f"Stats type: {type(stats)}")
-                print(f"Stats dir: {dir(stats)}")
-                
-                # Try to get the attribute directly - might be a naming issue
-                for attr in dir(stats):
-                    if 'document' in attr.lower() and 'number' in attr.lower():
-                        value = getattr(stats, attr)
-                        print(f"Found potential doc count attribute: {attr} = {value}")
-                        if isinstance(value, (int, float)) and value > 0:
-                            return value
-                            
-            # Return 0 if we couldn't extract the count
-            return 0
-        except Exception as e:
-            if self.verbose:
-                print(f"Error extracting document count: {e}")
-            return 0
 
     def insert_embeddings(self, embeddings_with_payloads: List[Tuple[np.ndarray, Dict[str, Any]]]) -> None:
         """
         Insert documents with dense vector embeddings into Meilisearch.
+        COMPLETELY rewritten to ensure proper vector formatting.
         
         Args:
             embeddings_with_payloads: List of (embedding, payload) tuples
         """
         if not embeddings_with_payloads:
+            print("No embeddings provided to insert")
             return
         
         try:
             if not self.index:
                 raise ValueError(f"Index '{self.collection_name}' not initialized")
             
-            # Prepare documents for insertion with proper _vectors field
-            documents = []
-            for embedding, payload in embeddings_with_payloads:
-                # Generate ID if not provided
-                if 'id' not in payload:
-                    doc_id = str(uuid.uuid4())
-                else:
-                    doc_id = payload['id']
+            # CRITICAL: For Meilisearch v1.6+, embedder name must be "default" 
+            # and must match exactly what's configured in the index
+            embedder_name = "default"
+            
+            # Verify embedder exists
+            existing_embedders = self._get_existing_embedders()
+            
+            if self.verbose:
+                print(f"Current embedders configuration: {existing_embedders}")
                 
-                # Create document with all payload fields
-                document = {
-                    'id': doc_id,
-                    **payload  # Include all payload fields
+            # Configure embedder if needed
+            if embedder_name not in existing_embedders:
+                if self.verbose:
+                    print(f"Embedder '{embedder_name}' not configured. Setting it up now...")
+                
+                # Configure the embedder with proper dimensions
+                embedder_settings = {
+                    embedder_name: {
+                        'source': 'userProvided',
+                        'dimensions': self.vector_dim
+                    }
                 }
                 
-                # Add vector embedding in the _vectors field format per Meilisearch docs
-                document['_vectors'] = embedding.tolist()
-                
-                documents.append(document)
+                try:
+                    # Update embedders setting
+                    self._update_embedders(embedder_settings)
+                    existing_embedders = self._get_existing_embedders()
+                    
+                    if self.verbose:
+                        print(f"Updated embedders configuration: {existing_embedders}")
+                except Exception as e:
+                    print(f"Failed to configure embedder: {e}")
+                    print("Cannot proceed without a properly configured embedder")
+                    return
             
-            if self.verbose:
-                print(f"Inserting {len(documents)} documents with vector embeddings")
+            # Create a new list of validated documents
+            validated_documents = []
+            skipped_count = 0
             
-            # Insert documents in batches
-            batch_size = 100
-            for i in range(0, len(documents), batch_size):
-                batch = documents[i:i+batch_size]
+            for i, (embedding, payload) in enumerate(embeddings_with_payloads):
+                # STEP 1: Validate embedding
+                if embedding is None:
+                    if self.verbose:
+                        print(f"Skipping document #{i+1}: embedding is None")
+                    skipped_count += 1
+                    continue
+                    
+                if not isinstance(embedding, np.ndarray):
+                    if self.verbose:
+                        print(f"Skipping document #{i+1}: embedding is not a numpy array (type: {type(embedding)})")
+                    skipped_count += 1
+                    continue
+                    
+                if embedding.size == 0:
+                    if self.verbose:
+                        print(f"Skipping document #{i+1}: embedding array is empty")
+                    skipped_count += 1
+                    continue
+                    
+                # STEP 2: Convert embedding to proper format
+                try:
+                    # Convert numpy array to regular list
+                    vector_list = embedding.tolist()
+                    
+                    # Validate the list
+                    if not isinstance(vector_list, list):
+                        if self.verbose:
+                            print(f"Skipping document #{i+1}: embedding.tolist() did not return a list (type: {type(vector_list)})")
+                        skipped_count += 1
+                        continue
+                        
+                    if len(vector_list) == 0:
+                        if self.verbose:
+                            print(f"Skipping document #{i+1}: embedding list is empty after conversion")
+                        skipped_count += 1
+                        continue
+                    
+                    # Check dimensions - must match configured embedder
+                    embedder_config = existing_embedders.get(embedder_name, {})
+                    expected_dim = embedder_config.get('dimensions', self.vector_dim)
+                    
+                    if len(vector_list) != expected_dim:
+                        if self.verbose:
+                            print(f"Warning: Document #{i+1} has vector dimension {len(vector_list)}, " 
+                                f"expected {expected_dim}. Will try to fix.")
+                        
+                        # Try to fix dimensions
+                        if len(vector_list) > expected_dim:
+                            # Truncate
+                            vector_list = vector_list[:expected_dim]
+                        else:
+                            # Pad with zeros
+                            vector_list.extend([0.0] * (expected_dim - len(vector_list)))
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Skipping document #{i+1}: error converting embedding: {e}")
+                    skipped_count += 1
+                    continue
                 
-                if self.verbose and len(documents) > batch_size:
-                    print(f"Inserting batch {i//batch_size + 1}/{(len(documents)-1)//batch_size + 1}")
+                # STEP 3: Create document with proper vector format
+                try:
+                    # Generate document ID if not provided
+                    if 'id' not in payload:
+                        doc_id = str(uuid.uuid4())
+                    else:
+                        doc_id = payload['id']
+                    
+                    # Create a new clean document
+                    document = {
+                        'id': doc_id
+                    }
+                    
+                    # Copy all payload fields except reserved ones
+                    for key, value in payload.items():
+                        if key not in ['_vectors', 'id']:
+                            document[key] = value
+                    
+                    # CRITICAL: Format vectors according to Meilisearch v1.6+ requirements
+                    # Must be exactly: '_vectors': {'default': [values]}
+                    document['_vectors'] = {
+                        embedder_name: vector_list
+                    }
+                    
+                    # Add to validated documents
+                    validated_documents.append(document)
+                    
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Skipping document #{i+1}: error creating document: {e}")
+                    skipped_count += 1
+                    continue
+            
+            if skipped_count > 0:
+                print(f"Warning: Skipped {skipped_count} documents due to invalid embeddings or errors")
                 
-                # Add documents
-                task = self.index.add_documents(batch)
-                self._wait_for_task(task)
+            if not validated_documents:
+                print("Error: No valid documents to insert after validation")
+                return
                 
             if self.verbose:
-                print(f"Successfully inserted {len(documents)} documents with vector embeddings")
+                print(f"Inserting {len(validated_documents)} validated documents")
                 
+                # Debug the first document
+                first_doc = validated_documents[0]
+                print(f"Sample document:")
+                print(f"  ID: {first_doc['id']}")
+                
+                # Check content
+                if 'content' in first_doc:
+                    content = first_doc['content']
+                    print(f"  Content: {content[:50]}..." if len(content) > 50 else content)
+                elif 'text' in first_doc:
+                    text = first_doc['text']
+                    print(f"  Text: {text[:50]}..." if len(text) > 50 else text)
+                    
+                # Check vector format
+                if '_vectors' in first_doc:
+                    vectors = first_doc['_vectors']
+                    print(f"  _vectors type: {type(vectors)}")
+                    
+                    if embedder_name in vectors:
+                        vector_data = vectors[embedder_name]
+                        print(f"  Vector data type: {type(vector_data)}")
+                        print(f"  Vector dimensions: {len(vector_data)}")
+                        print(f"  First 5 values: {vector_data[:5]}")
+                    else:
+                        print(f"  ERROR: embedder '{embedder_name}' not found in _vectors")
+                else:
+                    print(f"  ERROR: _vectors field missing")
+            
+            # Insert documents in small batches
+            batch_size = 10  # Smaller batches for better error isolation
+            successful_count = 0
+            
+            for i in range(0, len(validated_documents), batch_size):
+                batch = validated_documents[i:i+batch_size]
+                
+                if self.verbose:
+                    print(f"Inserting batch {i//batch_size + 1}/{(len(validated_documents)-1)//batch_size + 1} ({len(batch)} documents)")
+                
+                try:
+                    # Insert the batch
+                    task = self.index.add_documents(batch)
+                    self._wait_for_task(task)
+                    successful_count += len(batch)
+                    
+                    if self.verbose:
+                        print(f"Successfully inserted batch of {len(batch)} documents")
+                        
+                except Exception as e:
+                    error_message = str(e)
+                    print(f"Error inserting batch: {error_message}")
+                    
+                    if "no vectors provided" in error_message.lower():
+                        print("Trying one document at a time to identify problematic ones...")
+                        
+                        # Try inserting documents one by one
+                        for doc in batch:
+                            try:
+                                # Double-check vector format for this specific document
+                                if '_vectors' not in doc:
+                                    print(f"Skipping document {doc['id']}: missing _vectors field")
+                                    continue
+                                    
+                                if not isinstance(doc['_vectors'], dict):
+                                    print(f"Skipping document {doc['id']}: _vectors is not a dictionary (type: {type(doc['_vectors'])})")
+                                    continue
+                                    
+                                if embedder_name not in doc['_vectors']:
+                                    print(f"Skipping document {doc['id']}: missing embedder '{embedder_name}' in _vectors")
+                                    continue
+                                    
+                                vector_data = doc['_vectors'][embedder_name]
+                                if not isinstance(vector_data, list):
+                                    print(f"Skipping document {doc['id']}: vector data is not a list (type: {type(vector_data)})")
+                                    continue
+                                    
+                                if len(vector_data) == 0:
+                                    print(f"Skipping document {doc['id']}: vector list is empty")
+                                    continue
+                                
+                                # Try to insert just this one document
+                                task = self.index.add_documents([doc])
+                                self._wait_for_task(task)
+                                successful_count += 1
+                                
+                                if self.verbose:
+                                    print(f"Successfully inserted document {doc['id']}")
+                                    
+                            except Exception as doc_e:
+                                print(f"Error inserting document {doc['id']}: {doc_e}")
+                    else:
+                        # Other type of error - might not be related to vector format
+                        print(f"Unknown error type, cannot recover automatically.")
+            
+            print(f"Successfully inserted {successful_count}/{len(validated_documents)} documents")
+            
         except Exception as e:
-            print(f"Error inserting documents with vectors: {str(e)}")
-            raise
+            print(f"Critical error in insert_embeddings: {e}")
+            import traceback
+            traceback.print_exc()
 
-    def insert_embeddings_with_sparse(self, embeddings_with_sparse: List[Tuple[np.ndarray, Dict[str, Any], Tuple[List[int], List[float]]]]) -> None:
-        """
-        Insert documents with both dense and sparse vector embeddings.
-        """
-        if not embeddings_with_sparse:
-            return
-        
-        try:
-            if not self.index:
-                raise ValueError(f"Index '{self.collection_name}' not initialized")
-            
-            # Prepare documents with both dense and sparse embeddings
-            documents = []
-            for dense_embedding, payload, sparse_vector in embeddings_with_sparse:
-                # Generate ID if not provided
-                if 'id' not in payload:
-                    doc_id = str(uuid.uuid4())
-                else:
-                    doc_id = payload['id']
-                
-                # Extract sparse indices and values
-                sparse_indices, sparse_values = sparse_vector
-                
-                # Create a sparse terms field to help with text search
-                sparse_terms = []
-                for idx, val in zip(sparse_indices, sparse_values):
-                    if val > 0.1:  # Only include significant terms
-                        sparse_terms.append(f"term_{idx}")
-                
-                # Create document with all fields
-                document = {
-                    'id': doc_id,
-                    'sparse_terms': " ".join(sparse_terms),
-                    **payload  # Include all payload fields
-                }
-                
-                # Add vector embedding in the _vectors field with the embedder name
-                # The error suggests we need to specify the embedder name
-                document['_vectors'] = {
-                    'default': dense_embedding.tolist()  # Use 'default' as the embedder name
-                }
-                
-                documents.append(document)
-            
-            if self.verbose:
-                print(f"Inserting {len(documents)} documents with properly formatted vector embeddings")
-            
-            # Insert documents in batches
-            batch_size = 100
-            for i in range(0, len(documents), batch_size):
-                batch = documents[i:i+batch_size]
-                
-                if self.verbose and len(documents) > batch_size:
-                    print(f"Inserting batch {i//batch_size + 1}/{(len(documents)-1)//batch_size + 1}")
-                
-                # Add documents
-                task = self.index.add_documents(batch)
-                self._wait_for_task(task)
-                
-            if self.verbose:
-                print(f"Successfully inserted {len(documents)} documents with vector embeddings")
-                
-        except Exception as e:
-            print(f"Error inserting documents with vectors: {str(e)}")
-            raise
-    
     def search_hybrid(self, query: str, processor: Any, limit: int, 
                     prefetch_limit: int = 50, fusion_type: str = "rrf",
                     score_threshold: float = None, rerank: bool = False,
                     reranker_type: str = None):
         """
-        Perform hybrid search combining dense vectors and keywords.
+        Perform hybrid search combining dense vectors and keywords with improved debugging.
         """
         if processor is None:
             return {"error": "Hybrid search requires an embedding model"}
         
         try:
+            if self.verbose:
+                print(f"\n===== HYBRID SEARCH DETAILS =====")
+                print(f"Query: '{query}'")
+                print(f"Fusion type: {fusion_type}")
+                print(f"Processor model: {getattr(processor, 'dense_model_id', 'unknown')}")
+            
             # Generate query embedding
-            query_vector = processor.get_embedding(query)
+            try:
+                query_vector = processor.get_embedding(query)
+                if self.verbose:
+                    print(f"Generated query embedding with shape: {query_vector.shape}")
+                    print(f"Vector norm: {np.linalg.norm(query_vector)}")
+                    print(f"Vector sample (first 5 values): {query_vector[:5]}")
+            except Exception as e:
+                print(f"Error generating query embedding: {e}")
+                print("Falling back to keyword search")
+                return self.search_keyword(query, limit)
+            
+            # Always use "default" as the embedder name for consistency with our configuration
+            embedder_name = "default"
+            
+            # Verify that embedder exists
+            existing_embedders = self._get_existing_embedders()
+            
+            if self.verbose:
+                print(f"Available embedders: {existing_embedders}")
+                
+            if embedder_name not in existing_embedders:
+                if self.verbose:
+                    print(f"Warning: Embedder '{embedder_name}' not found in index")
+                    print(f"Available embedders: {list(existing_embedders.keys())}")
+                    print(f"Will try to use any available embedder instead")
+                
+                # Fall back to first available embedder if possible
+                if existing_embedders:
+                    embedder_name = next(iter(existing_embedders.keys()))
+                    if self.verbose:
+                        print(f"Falling back to embedder: '{embedder_name}'")
+                else:
+                    # Fallback to keyword search if no embedders available
+                    if self.verbose:
+                        print(f"No embedders found in index, falling back to keyword search")
+                    return self.search_keyword(query, limit)
             
             # Determine semantic ratio based on fusion type
             semantic_ratio = 0.5  # Default balanced ratio
@@ -679,24 +869,255 @@ class MeilisearchManager(VectorDBInterface):
                 semantic_ratio = 0.1  # Mostly keyword search
             
             if self.verbose:
-                print(f"Executing hybrid search with semanticRatio={semantic_ratio}")
+                print(f"Using semantic ratio: {semantic_ratio}")
+                print(f"Using embedder name: '{embedder_name}'")
             
-            # Build search parameters based on error messages and documentation
+            # Build search parameters based on available embedder
+            # This matches Meilisearch v1.6+ search parameter format exactly
             search_params = {
-                'limit': limit * 2,
+                'limit': limit * 3,  # Get more results for better filtering
                 'attributesToRetrieve': ['*'],
                 'vector': query_vector.tolist(),
                 'hybrid': {
-                    'embedder': 'default',      # Add the required embedder field
+                    'embedder': embedder_name,
                     'semanticRatio': semantic_ratio
                 }
             }
             
             if score_threshold is not None:
                 search_params['scoreThreshold'] = score_threshold
+                
+            if self.verbose:
+                print(f"Search parameters: {json.dumps(search_params, indent=2)}")
             
             # Execute hybrid search with both query text and vector
-            results = self.index.search(query, search_params)
+            try:
+                results = self.index.search(query, search_params)
+                
+                # Extract hits
+                hits = []
+                if hasattr(results, 'hits'):
+                    hits = results.hits
+                elif isinstance(results, dict) and 'hits' in results:
+                    hits = results['hits']
+                
+                if self.verbose:
+                    print(f"Hybrid search returned {len(hits)} raw results")
+                    
+                    # Examine top hits' content in detail for debugging
+                    if hits:
+                        print("\nTop 3 raw hits content:")
+                        for i, hit in enumerate(hits[:3]):
+                            print(f"\nHit #{i+1}:")
+                            if isinstance(hit, dict):
+                                if '_semanticScore' in hit:
+                                    print(f"  Semantic score: {hit['_semanticScore']}")
+                                print(f"  ID: {hit.get('id', 'unknown')}")
+                                print(f"  Content preview: {hit.get('content', hit.get('text', ''))[:100]}...")
+                                print(f"  Content length: {len(hit.get('content', hit.get('text', '')))}")
+                                vector_info = hit.get('_vectors', {})
+                                if vector_info:
+                                    for vec_name, vec in vector_info.items():
+                                        if isinstance(vec, list):
+                                            print(f"  Vector '{vec_name}' dimensions: {len(vec)}")
+                            else:
+                                print(f"  Type: {type(hit)}")
+                
+                # Filter out results with too small content or headers only
+                filtered_hits = []
+                for hit in hits:
+                    # Get text content from hit (may be in 'text' or 'content' field)
+                    text = ""
+                    if isinstance(hit, dict):
+                        if 'content' in hit and hit['content']:
+                            text = hit['content']
+                        elif 'text' in hit and hit['text']:
+                            text = hit['text']
+                    else:
+                        if hasattr(hit, 'content') and getattr(hit, 'content'):
+                            text = getattr(hit, 'content')
+                        elif hasattr(hit, 'text') and getattr(hit, 'text'):
+                            text = getattr(hit, 'text')
+                    
+                    # Skip chunks that are likely headers or too short for meaningful content
+                    if len(text) < 100:  # Skip very short chunks
+                        if self.verbose:
+                            print(f"Filtering out short chunk ({len(text)} chars): '{text[:50]}'")
+                        continue
+                        
+                    # Skip chunks that are only page numbers or section headers
+                    if re.match(r'^[\d]+\s*$', text.strip()) or re.match(r'^[A-Z\s]+$', text.strip()):
+                        if self.verbose:
+                            print(f"Filtering out header/page number: '{text.strip()}'")
+                        continue
+                    
+                    # Check if query terms appear in the text - boost relevance if they do
+                    query_lower = query.lower()
+                    text_lower = text.lower()
+                    
+                    # Keep this result
+                    filtered_hits.append(hit)
+                
+                if self.verbose:
+                    print(f"\nFiltered to {len(filtered_hits)} results with meaningful content")
+                
+                # If no quality results from hybrid search, fall back to keyword search
+                if not filtered_hits:
+                    if self.verbose:
+                        print(f"No quality results from hybrid search, falling back to keyword search")
+                    return self.search_keyword(query, limit)
+            
+                # Format results
+                formatted_results = []
+                for hit in filtered_hits[:limit]:
+                    result = {}
+                    
+                    # Copy all fields
+                    if isinstance(hit, dict):
+                        for k, v in hit.items():
+                            result[k] = v
+                    else:
+                        for attr in dir(hit):
+                            if not attr.startswith('_') and not callable(getattr(hit, attr)):
+                                result[attr] = getattr(hit, attr)
+                    
+                    # Get semantic score if available
+                    if isinstance(hit, dict) and '_semanticScore' in hit:
+                        result['score'] = hit['_semanticScore']
+                    elif hasattr(hit, '_semanticScore'):
+                        result['score'] = hit._semanticScore
+                    else:
+                        result['score'] = 0.8  # Default score
+                    
+                    # Adjust score based on query term presence
+                    text = result.get('content', result.get('text', ''))
+                    query_lower = query.lower()
+                    if query_lower in text.lower():
+                        # Boost score if the query appears in the text
+                        result['score'] = min(0.95, result['score'] + 0.15)
+                    
+                    # Ensure content field exists
+                    if 'text' in result and 'content' not in result:
+                        result['content'] = result['text']
+                    
+                    # Add payload field for compatibility
+                    result['payload'] = {}
+                    for k, v in result.items():
+                        if k != 'payload':
+                            result['payload'][k] = v
+                    
+                    formatted_results.append(result)
+                
+                return formatted_results
+                
+            except Exception as search_e:
+                print(f"Error during hybrid search operation: {search_e}")
+                print("Falling back to keyword search")
+                return self.search_keyword(query, limit)
+                
+        except Exception as e:
+            if self.verbose:
+                print(f"Error in hybrid search: {e}")
+                import traceback
+                traceback.print_exc()
+                print("Falling back to keyword search")
+            return self.search_keyword(query, limit)
+    
+    def search_dense(self, query: str, processor: Any, limit: int, score_threshold: float = None,
+                    rerank: bool = False, reranker_type: str = None):
+        """
+        Perform vector search according to Meilisearch v1.6+ requirements with detailed logging.
+        """
+        if processor is None:
+            return {"error": "Vector search requires an embedding model"}
+        
+        try:
+            if self.verbose:
+                print(f"\n===== VECTOR SEARCH DETAILS =====")
+                print(f"Query: '{query}'")
+                print(f"Processor model: {getattr(processor, 'dense_model_id', 'unknown')}")
+            
+            # Generate query embedding with error handling
+            try:
+                query_vector = processor.get_embedding(query)
+                if self.verbose:
+                    print(f"Generated query embedding with shape: {query_vector.shape}")
+                    print(f"Vector norm: {np.linalg.norm(query_vector)}")
+                    print(f"Vector sample (first 5 values): {query_vector[:5]}")
+            except Exception as e:
+                print(f"Error generating query embedding: {e}")
+                print("Falling back to keyword search")
+                return self.search_keyword(query, limit)
+            
+            # Always use "default" as the embedder name for consistency with our configuration
+            embedder_name = "default"
+            
+            # Verify that embedder exists
+            existing_embedders = self._get_existing_embedders()
+            
+            if self.verbose:
+                print(f"Available embedders: {existing_embedders}")
+                
+            if embedder_name not in existing_embedders:
+                if self.verbose:
+                    print(f"Warning: Embedder '{embedder_name}' not found in index")
+                    print(f"Available embedders: {list(existing_embedders.keys())}")
+                    print(f"Will try to use any available embedder instead")
+                
+                # Fall back to first available embedder if possible
+                if existing_embedders:
+                    embedder_name = next(iter(existing_embedders.keys()))
+                    if self.verbose:
+                        print(f"Falling back to embedder: '{embedder_name}'")
+                else:
+                    # Fallback to keyword search if no embedders available
+                    if self.verbose:
+                        print(f"No embedders found in index, falling back to keyword search")
+                    return self.search_keyword(query, limit)
+            
+            if self.verbose:
+                print(f"Using vector search with embedder name: '{embedder_name}'")
+            
+            # Set up search parameters per Meilisearch v1.6+ (vector-only search)
+            # Either use vector-only search or hybrid with semanticRatio=1.0
+            try:
+                # First try vector-only search (recommended for pure semantic search)
+                search_params = {
+                    'limit': limit * 3,  # Get more results than needed for filtering
+                    'attributesToRetrieve': ['*'],
+                    'vector': query_vector.tolist(),
+                }
+                
+                if score_threshold is not None:
+                    search_params['scoreThreshold'] = score_threshold
+                    
+                if self.verbose:
+                    print(f"Using pure vector search parameters")
+                
+                # Try pure vector search first (empty query)
+                results = self.index.search('', search_params)
+                
+            except Exception as e:
+                if self.verbose:
+                    print(f"Pure vector search failed: {e}")
+                    print("Trying hybrid search with 100% semantic ratio")
+                
+                # Fall back to hybrid search with 100% semantic ratio
+                search_params = {
+                    'limit': limit * 3,  # Get more results than needed for filtering
+                    'attributesToRetrieve': ['*'],
+                    'vector': query_vector.tolist(),
+                    'hybrid': {
+                        'embedder': embedder_name,
+                        'semanticRatio': 1.0  # Pure semantic search
+                    }
+                }
+                
+                if score_threshold is not None:
+                    search_params['scoreThreshold'] = score_threshold
+                
+                # Run search with empty query for pure vector search
+                results = self.index.search('', search_params)
             
             # Extract hits
             hits = []
@@ -706,11 +1127,70 @@ class MeilisearchManager(VectorDBInterface):
                 hits = results['hits']
             
             if self.verbose:
-                print(f"Hybrid search returned {len(hits)} results")
+                print(f"Vector search returned {len(hits)} raw results")
+                
+                # Examine top hits' content in detail for debugging
+                if hits:
+                    print("\nTop 3 raw hits content:")
+                    for i, hit in enumerate(hits[:3]):
+                        print(f"\nHit #{i+1}:")
+                        if isinstance(hit, dict):
+                            if '_semanticScore' in hit:
+                                print(f"  Semantic score: {hit['_semanticScore']}")
+                            print(f"  ID: {hit.get('id', 'unknown')}")
+                            print(f"  Content preview: {hit.get('content', hit.get('text', ''))[:100]}...")
+                            print(f"  Content length: {len(hit.get('content', hit.get('text', '')))}")
+                            vector_info = hit.get('_vectors', {})
+                            if vector_info:
+                                for vec_name, vec in vector_info.items():
+                                    if isinstance(vec, list):
+                                        print(f"  Vector '{vec_name}' dimensions: {len(vec)}")
+                        else:
+                            print(f"  Type: {type(hit)}")
+                
+            # Filter out problematic results (too short, headers only, etc.)
+            filtered_hits = []
+            for hit in hits:
+                # Get text content from hit (may be in 'text' or 'content' field)
+                text = ""
+                if isinstance(hit, dict):
+                    if 'content' in hit and hit['content']:
+                        text = hit['content']
+                    elif 'text' in hit and hit['text']:
+                        text = hit['text']
+                else:
+                    if hasattr(hit, 'content') and getattr(hit, 'content'):
+                        text = getattr(hit, 'content')
+                    elif hasattr(hit, 'text') and getattr(hit, 'text'):
+                        text = getattr(hit, 'text')
+                
+                # Skip chunks that are likely headers or too short for meaningful content
+                if len(text) < 100:  # Skip very short chunks
+                    if self.verbose:
+                        print(f"Filtering out short chunk ({len(text)} chars): '{text[:50]}'")
+                    continue
+                    
+                # Skip chunks that are only page numbers or section headers
+                if re.match(r'^[\d]+\s*$', text.strip()) or re.match(r'^[A-Z\s]+$', text.strip()):
+                    if self.verbose:
+                        print(f"Filtering out header/page number: '{text.strip()}'")
+                    continue
+                    
+                # Keep this result
+                filtered_hits.append(hit)
+            
+            if self.verbose:
+                print(f"\nFiltered to {len(filtered_hits)} results with meaningful content")
+                
+            # If no quality results from vector search, fall back to keyword search
+            if not filtered_hits:
+                if self.verbose:
+                    print(f"No quality results from vector search, falling back to keyword search")
+                return self.search_keyword(query, limit)
             
             # Format results
             formatted_results = []
-            for hit in hits[:limit]:
+            for hit in filtered_hits[:limit]:
                 result = {}
                 
                 # Copy all fields
@@ -730,6 +1210,13 @@ class MeilisearchManager(VectorDBInterface):
                 else:
                     result['score'] = 0.8  # Default score
                 
+                # Adjust score based on query term presence
+                text = result.get('content', result.get('text', ''))
+                query_lower = query.lower()
+                if query_lower in text.lower():
+                    # Boost score if the query appears in the text
+                    result['score'] = min(0.95, result['score'] + 0.15)
+                
                 # Ensure content field exists
                 if 'text' in result and 'content' not in result:
                     result['content'] = result['text']
@@ -746,94 +1233,118 @@ class MeilisearchManager(VectorDBInterface):
             
         except Exception as e:
             if self.verbose:
-                print(f"Error in hybrid search: {e}")
+                print(f"Error in vector search: {e}")
+                import traceback
+                traceback.print_exc()
                 print("Falling back to keyword search")
             return self.search_keyword(query, limit)
-    
-    def search(self, query: str, search_type: str = "hybrid", limit: int = 10,
-            processor: Any = None, prefetch_limit: int = 50, fusion_type: str = "rrf",
-            relevance_tuning: bool = True, context_size: int = 300,
-            score_threshold: float = None, rerank: bool = False,
-            reranker_type: str = None):
+
+    def search_keyword(self, query: str, limit: int = 10, score_threshold: float = None,
+                    rerank: bool = False, reranker_type: str = None):
         """
-        Search with various options.
+        Keyword search with improved scoring.
         """
         try:
-            query = query.strip()
-            if not query:
+            if not query.strip():
                 return {"error": "Empty query"}
             
-            if not self.index:
-                return {"error": f"Index '{self.collection_name}' not found"}
-            
-            # Determine correct search method based on type
-            if search_type.lower() in ["vector", "dense"]:
-                if processor is None:
-                    return {"error": "Vector search requires an embedding model"}
-                points = self.search_dense(query, processor, limit, score_threshold, rerank, reranker_type)
-            elif search_type.lower() == "sparse":
-                if processor is None:
-                    return {"error": "Sparse search requires an embedding model"}
-                points = self.search_sparse(query, processor, limit, score_threshold, rerank, reranker_type)
-            elif search_type.lower() in ["keyword", "fts"]:
-                points = self.search_keyword(query, limit, score_threshold, rerank, reranker_type)
-            else:  # Default to hybrid
-                if processor is None:
-                    return {"error": "Hybrid search requires an embedding model"}
-                points = self.search_hybrid(query, processor, limit, prefetch_limit,
-                                        fusion_type, score_threshold, rerank, reranker_type)
-            
-            # Check for errors
-            if isinstance(points, dict) and "error" in points:
-                return points
-            
-            # Create a retriever function for context
-            def context_retriever(file_path, chunk_index, window=1):
-                return self._retrieve_context_for_chunk(file_path, chunk_index, window)
-            
-            # Ensure points have scores - handle both object and dictionary points
-            if points:
-                for i in range(len(points)):
-                    # Handle dictionary case (most common)
-                    if isinstance(points[i], dict):
-                        if 'score' not in points[i] or points[i]['score'] is None:
-                            points[i]['score'] = 0.75  # Default score
+            # First, ensure the text field is searchable
+            if self.verbose:
+                print("\n=== PREPARING INDEX FOR KEYWORD SEARCH ===")
+                try:
+                    # Get current settings
+                    settings = self.index.get_settings()
+                    searchable_attrs = []
+                    
+                    if isinstance(settings, dict) and 'searchableAttributes' in settings:
+                        searchable_attrs = settings['searchableAttributes']
+                    elif hasattr(settings, 'searchableAttributes'):
+                        searchable_attrs = settings.searchableAttributes
+                    elif hasattr(settings, 'searchable_attributes'):
+                        searchable_attrs = settings.searchable_attributes
                         
-                        # Set score in multiple places for compatibility
-                        points[i]['_rankingScore'] = points[i]['score'] 
-                        points[i]['_score'] = points[i]['score']
-                        points[i]['rankingScore'] = points[i]['score']
+                    # Check if 'text' is already in searchableAttributes
+                    if 'text' not in searchable_attrs and '*' not in searchable_attrs:
+                        print("Adding 'text' to searchable attributes")
                         
-                        # Ensure payload exists and has score
-                        if 'payload' not in points[i]:
-                            points[i]['payload'] = {}
-                            
-                        points[i]['payload']['score'] = points[i]['score']
-                        points[i]['payload']['_rankingScore'] = points[i]['score']
-                        points[i]['payload']['_score'] = points[i]['score']
-                    elif hasattr(points[i], 'score'):
-                        # Object case
-                        if points[i].score is None:
-                            points[i].score = 0.75
-                            
-                        # Add other score fields as attributes
-                        if not hasattr(points[i], '_rankingScore'):
-                            setattr(points[i], '_rankingScore', points[i].score)
-                        if not hasattr(points[i], '_score'):
-                            setattr(points[i], '_score', points[i].score)
+                        # Add 'text' to searchable attributes
+                        if isinstance(searchable_attrs, list):
+                            searchable_attrs.append('text')
+                        else:
+                            # Convert to list if needed
+                            searchable_attrs = list(searchable_attrs)
+                            searchable_attrs.append('text')
+                        
+                        # Update the settings
+                        if isinstance(settings, dict):
+                            settings['searchableAttributes'] = searchable_attrs
+                            task = self.index.update_settings(settings)
+                            print("Index settings updated - waiting for task to complete")
+                            self._wait_for_task(task)
+                            print("Index settings update completed")
+                        else:
+                            # Handle object-style settings
+                            settings_dict = {'searchableAttributes': searchable_attrs}
+                            task = self.index.update_settings(settings_dict)
+                            print("Index settings updated - waiting for task to complete")
+                            self._wait_for_task(task)
+                            print("Index settings update completed")
+                    else:
+                        print("'text' is already searchable or all attributes are searchable")
+                except Exception as e:
+                    print(f"Error updating index settings: {e}")
+                    print("Proceeding with search using current configuration")
+                    
+                print("=== END INDEX PREPARATION ===\n")
             
-            # Format results with improved preview
-            return TextProcessor.format_search_results(
-                points, query, search_type, processor, context_size,
-                retriever=context_retriever,
-                db_type="meilisearch"
-            )
+            # Now search directly in the text field
+            if self.verbose:
+                print(f"Executing search for '{query}' using 'text' field")
+                
+            text_params = {
+                'limit': limit * 3,
+                'attributesToRetrieve': ['*'],
+                'attributesToSearchOn': ['text'],
+                'attributesToHighlight': ['text'],
+                'highlightPreTag': '<<<HIGHLIGHT>>>',
+                'highlightPostTag': '<<<END_HIGHLIGHT>>>',
+                'showMatchesPosition': True,
+                'showRankingScore': True
+            }
+            
+            try:
+                results = self.index.search(query, text_params)
+                
+                # Extract hits
+                hits = []
+                if hasattr(results, 'hits'):
+                    hits = results.hits
+                elif isinstance(results, dict) and 'hits' in results:
+                    hits = results['hits']
+                    
+                if hits and len(hits) > 0:
+                    if self.verbose:
+                        print(f"Found {len(hits)} results searching in 'text' field")
+                        
+                    # Adapt results with proper scoring
+                    adapted_hits = [self._adapt_meilisearch_result(hit, query) for hit in hits]
+                    
+                    # Sort by score
+                    adapted_hits.sort(key=lambda x: x.get('score', 0), reverse=True)
+                    
+                    return adapted_hits[:limit]
+            except Exception as e:
+                if self.verbose:
+                    print(f"Error during search: {e}")
+                    
+            return []
             
         except Exception as e:
-            print(f"Error during search: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return {"error": str(e)}
+            if self.verbose:
+                print(f"Error in keyword search: {e}")
+                import traceback
+                traceback.print_exc()
+            return {"error": f"Error in keyword search: {str(e)}"}
     
     def _adapt_meilisearch_result(self, hit, query=None):
         """
@@ -935,143 +1446,404 @@ class MeilisearchManager(VectorDBInterface):
         
         return result
     
-    def search_dense(self, query: str, processor: Any, limit: int, score_threshold: float = None,
-                    rerank: bool = False, reranker_type: str = None):
-        """
-        Perform vector search according to Meilisearch API requirements.
-        """
-        if processor is None:
-            return {"error": "Vector search requires an embedding model"}
-        
+    def _check_embedder_configured(self, embedder_name):
+        """Check if an embedder is configured in the index"""
         try:
-            # Generate query embedding
-            query_vector = processor.get_embedding(query)
+            # Get existing embedders
+            existing_embedders = self._get_existing_embedders()
             
-            if self.verbose:
-                print(f"Executing vector search with {len(query_vector)}-dimensional query vector")
-            
-            # Based on the error messages, Meilisearch requires a 'hybrid' parameter 
-            # with an 'embedder' field when using vector search
-            search_params = {
-                'limit': limit * 2,
-                'attributesToRetrieve': ['*'],
-                'vector': query_vector.tolist(),
-                'hybrid': {
-                    'embedder': 'default',  # Use the default embedder name
-                    'semanticRatio': 1.0    # Pure semantic search (100% vector)
-                }
-            }
-            
-            if score_threshold is not None:
-                search_params['scoreThreshold'] = score_threshold
-            
-            # Run search with empty query for pure vector search
-            results = self.index.search('', search_params)
-            
-            # Extract hits
-            hits = []
-            if hasattr(results, 'hits'):
-                hits = results.hits
-            elif isinstance(results, dict) and 'hits' in results:
-                hits = results['hits']
-            
-            if self.verbose:
-                print(f"Vector search returned {len(hits)} results")
-                
-            # Format results
-            formatted_results = []
-            for hit in hits[:limit]:
-                result = {}
-                
-                # Copy all fields
-                if isinstance(hit, dict):
-                    for k, v in hit.items():
-                        result[k] = v
-                else:
-                    for attr in dir(hit):
-                        if not attr.startswith('_') and not callable(getattr(hit, attr)):
-                            result[attr] = getattr(hit, attr)
-                
-                # Get semantic score if available
-                if isinstance(hit, dict) and '_semanticScore' in hit:
-                    result['score'] = hit['_semanticScore']
-                elif hasattr(hit, '_semanticScore'):
-                    result['score'] = hit._semanticScore
-                else:
-                    result['score'] = 0.8  # Default score
-                
-                # Ensure content field exists
-                if 'text' in result and 'content' not in result:
-                    result['content'] = result['text']
-                
-                # Add payload field for compatibility
-                result['payload'] = {}
-                for k, v in result.items():
-                    if k != 'payload':
-                        result['payload'][k] = v
-                
-                formatted_results.append(result)
-            
-            return formatted_results
-            
+            # Check if the embedder exists
+            return embedder_name in existing_embedders
         except Exception as e:
             if self.verbose:
-                print(f"Error in vector search: {e}")
-                print("Falling back to keyword search")
-            return self.search_keyword(query, limit)
+                print(f"Error checking embedder configuration: {e}")
+            return False
+        
+    def insert_embeddings_with_sparse(self, embeddings_with_sparse: List[Tuple[np.ndarray, Dict[str, Any], Tuple[List[int], List[float]]]]) -> None:
+        """
+        Insert documents with both dense and sparse vector embeddings.
+        Rewritten to ensure proper Meilisearch v1.6+ vector format compliance.
+        
+        Args:
+            embeddings_with_sparse: List of (dense_embedding, payload, sparse_vector) tuples
+        """
+        if not embeddings_with_sparse:
+            print("No embeddings provided to insert")
+            return
+        
+        try:
+            if not self.index:
+                raise ValueError(f"Index '{self.collection_name}' not initialized")
+            
+            # CRITICAL: For Meilisearch v1.6+, embedder name must be "default" 
+            # and must match exactly what's configured in the index
+            embedder_name = "default"
+            
+            # Verify embedder exists
+            existing_embedders = self._get_existing_embedders()
+            
+            if self.verbose:
+                print(f"Current embedders configuration: {existing_embedders}")
+                
+            # Configure embedder if needed
+            if embedder_name not in existing_embedders:
+                if self.verbose:
+                    print(f"Embedder '{embedder_name}' not configured. Setting it up now...")
+                
+                # Configure the embedder with proper dimensions
+                embedder_settings = {
+                    embedder_name: {
+                        'source': 'userProvided',
+                        'dimensions': self.vector_dim
+                    }
+                }
+                
+                try:
+                    # Update embedders setting
+                    self._update_embedders(embedder_settings)
+                    existing_embedders = self._get_existing_embedders()
+                    
+                    if self.verbose:
+                        print(f"Updated embedders configuration: {existing_embedders}")
+                except Exception as e:
+                    print(f"Failed to configure embedder: {e}")
+                    print("Cannot proceed without a properly configured embedder")
+                    return
+            
+            # Create a new list of validated documents
+            validated_documents = []
+            skipped_count = 0
+            
+            for i, (dense_embedding, payload, sparse_vector) in enumerate(embeddings_with_sparse):
+                # STEP 1: Validate dense embedding
+                if dense_embedding is None:
+                    if self.verbose:
+                        print(f"Skipping document #{i+1}: dense embedding is None")
+                    skipped_count += 1
+                    continue
+                    
+                if not isinstance(dense_embedding, np.ndarray):
+                    if self.verbose:
+                        print(f"Skipping document #{i+1}: dense embedding is not a numpy array (type: {type(dense_embedding)})")
+                    skipped_count += 1
+                    continue
+                    
+                if dense_embedding.size == 0:
+                    if self.verbose:
+                        print(f"Skipping document #{i+1}: dense embedding array is empty")
+                    skipped_count += 1
+                    continue
+                    
+                # STEP 2: Convert dense embedding to proper format
+                try:
+                    # Convert numpy array to regular list
+                    vector_list = dense_embedding.tolist()
+                    
+                    # Validate the list
+                    if not isinstance(vector_list, list):
+                        if self.verbose:
+                            print(f"Skipping document #{i+1}: dense embedding.tolist() did not return a list (type: {type(vector_list)})")
+                        skipped_count += 1
+                        continue
+                        
+                    if len(vector_list) == 0:
+                        if self.verbose:
+                            print(f"Skipping document #{i+1}: dense embedding list is empty after conversion")
+                        skipped_count += 1
+                        continue
+                    
+                    # Check dimensions - must match configured embedder
+                    embedder_config = existing_embedders.get(embedder_name, {})
+                    expected_dim = embedder_config.get('dimensions', self.vector_dim)
+                    
+                    if len(vector_list) != expected_dim:
+                        if self.verbose:
+                            print(f"Warning: Document #{i+1} has vector dimension {len(vector_list)}, " 
+                                f"expected {expected_dim}. Will try to fix.")
+                        
+                        # Try to fix dimensions
+                        if len(vector_list) > expected_dim:
+                            # Truncate
+                            vector_list = vector_list[:expected_dim]
+                        else:
+                            # Pad with zeros
+                            vector_list.extend([0.0] * (expected_dim - len(vector_list)))
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Skipping document #{i+1}: error converting dense embedding: {e}")
+                    skipped_count += 1
+                    continue
+                
+                # STEP 3: Create document with proper vector format
+                try:
+                    # Generate document ID if not provided
+                    if 'id' not in payload:
+                        doc_id = str(uuid.uuid4())
+                    else:
+                        doc_id = payload['id']
+                    
+                    # Create a new clean document
+                    document = {
+                        'id': doc_id
+                    }
+                    
+                    # Copy all payload fields except reserved ones
+                    for key, value in payload.items():
+                        if key not in ['_vectors', 'id']:
+                            document[key] = value
+                    
+                    # CRITICAL: Format vectors according to Meilisearch v1.6+ requirements
+                    # For userProvided source, must be exactly: '_vectors': {'default': [values]}
+                    document['_vectors'] = {
+                        embedder_name: vector_list
+                    }
+                    
+                    # Process sparse vector for keyword search (not directly used by Meilisearch for vectors)
+                    # Meilisearch doesn't support sparse vectors directly, but we can create a text field
+                    # that simulates sparse vector search
+                    if sparse_vector:
+                        try:
+                            sparse_indices, sparse_values = sparse_vector
+                            
+                            # Create sparse terms for better text matching
+                            sparse_terms = []
+                            for idx, val in zip(sparse_indices, sparse_values):
+                                if val > 0.05:  # Only include significant terms
+                                    sparse_terms.append(f"term_{idx}")
+                            
+                            # Add sparse terms field for text search
+                            if sparse_terms:
+                                document['sparse_terms'] = " ".join(sparse_terms)
+                                
+                        except Exception as e:
+                            if self.verbose:
+                                print(f"Warning: Could not process sparse vector for document #{i+1}: {e}")
+                                print("Continuing with dense vector only")
+                    
+                    # Add to validated documents
+                    validated_documents.append(document)
+                    
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Skipping document #{i+1}: error creating document: {e}")
+                    skipped_count += 1
+                    continue
+            
+            if skipped_count > 0:
+                print(f"Warning: Skipped {skipped_count} documents due to invalid embeddings or errors")
+                
+            if not validated_documents:
+                print("Error: No valid documents to insert after validation")
+                return
+                
+            if self.verbose:
+                print(f"Inserting {len(validated_documents)} validated documents")
+                
+                # Debug the first document
+                first_doc = validated_documents[0]
+                print(f"Sample document:")
+                print(f"  ID: {first_doc['id']}")
+                
+                # Check content
+                if 'content' in first_doc:
+                    content = first_doc['content']
+                    print(f"  Content: {content[:50]}..." if len(content) > 50 else content)
+                elif 'text' in first_doc:
+                    text = first_doc['text']
+                    print(f"  Text: {text[:50]}..." if len(text) > 50 else text)
+                    
+                # Check vector format
+                if '_vectors' in first_doc:
+                    vectors = first_doc['_vectors']
+                    print(f"  _vectors type: {type(vectors)}")
+                    
+                    if embedder_name in vectors:
+                        vector_data = vectors[embedder_name]
+                        print(f"  Vector data type: {type(vector_data)}")
+                        print(f"  Vector dimensions: {len(vector_data)}")
+                        print(f"  First 5 values: {vector_data[:5]}")
+                    else:
+                        print(f"  ERROR: embedder '{embedder_name}' not found in _vectors")
+                else:
+                    print(f"  ERROR: _vectors field missing")
+                    
+                # Check sparse terms
+                if 'sparse_terms' in first_doc:
+                    print(f"  Sparse terms count: {len(first_doc['sparse_terms'].split())}")
+            
+            # Insert documents in small batches
+            batch_size = 10  # Smaller batches for better error isolation
+            successful_count = 0
+            
+            for i in range(0, len(validated_documents), batch_size):
+                batch = validated_documents[i:i+batch_size]
+                
+                if self.verbose:
+                    print(f"Inserting batch {i//batch_size + 1}/{(len(validated_documents)-1)//batch_size + 1} ({len(batch)} documents)")
+                
+                try:
+                    # Insert the batch
+                    task = self.index.add_documents(batch)
+                    self._wait_for_task(task)
+                    successful_count += len(batch)
+                    
+                    if self.verbose:
+                        print(f"Successfully inserted batch of {len(batch)} documents")
+                        
+                except Exception as e:
+                    error_message = str(e)
+                    print(f"Error inserting batch: {error_message}")
+                    
+                    if "no vectors provided" in error_message.lower():
+                        print("Trying one document at a time to identify problematic ones...")
+                        
+                        # Try inserting documents one by one
+                        for doc in batch:
+                            try:
+                                # Double-check vector format for this specific document
+                                if '_vectors' not in doc:
+                                    print(f"Skipping document {doc['id']}: missing _vectors field")
+                                    continue
+                                    
+                                if not isinstance(doc['_vectors'], dict):
+                                    print(f"Skipping document {doc['id']}: _vectors is not a dictionary (type: {type(doc['_vectors'])})")
+                                    continue
+                                    
+                                if embedder_name not in doc['_vectors']:
+                                    print(f"Skipping document {doc['id']}: missing embedder '{embedder_name}' in _vectors")
+                                    continue
+                                    
+                                vector_data = doc['_vectors'][embedder_name]
+                                if not isinstance(vector_data, list):
+                                    print(f"Skipping document {doc['id']}: vector data is not a list (type: {type(vector_data)})")
+                                    continue
+                                    
+                                if len(vector_data) == 0:
+                                    print(f"Skipping document {doc['id']}: vector list is empty")
+                                    continue
+                                
+                                # Try to insert just this one document
+                                task = self.index.add_documents([doc])
+                                self._wait_for_task(task)
+                                successful_count += 1
+                                
+                                if self.verbose:
+                                    print(f"Successfully inserted document {doc['id']}")
+                                    
+                            except Exception as doc_e:
+                                print(f"Error inserting document {doc['id']}: {doc_e}")
+                    else:
+                        # Other type of error - might not be related to vector format
+                        print(f"Unknown error type, cannot recover automatically.")
+            
+            print(f"Successfully inserted {successful_count}/{len(validated_documents)} documents")
+            
+        except Exception as e:
+            print(f"Critical error in insert_embeddings_with_sparse: {e}")
+            import traceback
+            traceback.print_exc()
 
-    def _vector_similarity(self, vec1, vec2):
-        """Calculate cosine similarity between two vectors"""
-        import numpy as np
-        
-        # Convert to numpy arrays if not already
-        if not isinstance(vec1, np.ndarray):
-            vec1 = np.array(vec1)
-        if not isinstance(vec2, np.ndarray):
-            vec2 = np.array(vec2)
-        
-        # Calculate cosine similarity
-        dot_product = np.dot(vec1, vec2)
-        norm_a = np.linalg.norm(vec1)
-        norm_b = np.linalg.norm(vec2)
-        
-        # Avoid division by zero
-        if norm_a == 0 or norm_b == 0:
-            return 0
-        
-        return dot_product / (norm_a * norm_b)
-    
-    def _cosine_similarity(self, vec1, vec2):
-        """Calculate cosine similarity between two vectors"""
-        import numpy as np
-        
-        # Convert to numpy arrays if they aren't already
-        if not isinstance(vec1, np.ndarray):
-            vec1 = np.array(vec1)
-        if not isinstance(vec2, np.ndarray):
-            vec2 = np.array(vec2)
-        
-        # Calculate cosine similarity
-        dot_product = np.dot(vec1, vec2)
-        norm_a = np.linalg.norm(vec1)
-        norm_b = np.linalg.norm(vec2)
-        
-        # Avoid division by zero
-        if norm_a == 0 or norm_b == 0:
-            return 0
-        
-        return dot_product / (norm_a * norm_b)
-    
+    def search(self, query: str, search_type: str = "hybrid", limit: int = 10,
+            processor: Any = None, prefetch_limit: int = 50, fusion_type: str = "rrf",
+            relevance_tuning: bool = True, context_size: int = 300,
+            score_threshold: float = None, rerank: bool = False,
+            reranker_type: str = None):
+        """
+        Search with various options.
+        """
+        try:
+            query = query.strip()
+            if not query:
+                return {"error": "Empty query"}
+            
+            if not self.index:
+                return {"error": f"Index '{self.collection_name}' not found"}
+            
+            # Determine correct search method based on type
+            if search_type.lower() in ["vector", "dense"]:
+                if processor is None:
+                    return {"error": "Vector search requires an embedding model"}
+                points = self.search_dense(query, processor, limit, score_threshold, rerank, reranker_type)
+            elif search_type.lower() == "sparse":
+                if processor is None:
+                    return {"error": "Sparse search requires an embedding model"}
+                points = self.search_sparse(query, processor, limit, score_threshold, rerank, reranker_type)
+            elif search_type.lower() in ["keyword", "fts"]:
+                points = self.search_keyword(query, limit, score_threshold, rerank, reranker_type)
+            else:  # Default to hybrid
+                if processor is None:
+                    return {"error": "Hybrid search requires an embedding model"}
+                points = self.search_hybrid(query, processor, limit, prefetch_limit,
+                                        fusion_type, score_threshold, rerank, reranker_type)
+            
+            # Check for errors
+            if isinstance(points, dict) and "error" in points:
+                return points
+            
+            # Create a retriever function for context
+            def context_retriever(file_path, chunk_index, window=1):
+                return self._retrieve_context_for_chunk(file_path, chunk_index, window)
+            
+            # Ensure points have scores - handle both object and dictionary points
+            if points:
+                for i in range(len(points)):
+                    # Skip if result is in error format
+                    if isinstance(points[i], dict) and "error" in points[i]:
+                        continue
+                        
+                    # Handle dictionary case (most common)
+                    if isinstance(points[i], dict):
+                        if 'score' not in points[i] or points[i]['score'] is None:
+                            points[i]['score'] = 0.75  # Default score
+                        
+                        # Set score in multiple places for compatibility
+                        points[i]['_rankingScore'] = points[i]['score'] 
+                        points[i]['_score'] = points[i]['score']
+                        points[i]['rankingScore'] = points[i]['score']
+                        
+                        # Ensure payload exists and has score
+                        if 'payload' not in points[i]:
+                            points[i]['payload'] = {}
+                            
+                        points[i]['payload']['score'] = points[i]['score']
+                        points[i]['payload']['_rankingScore'] = points[i]['score']
+                        points[i]['payload']['_score'] = points[i]['score']
+                    elif hasattr(points[i], "score"):
+                        # Object case
+                        if points[i].score is None:
+                            points[i].score = 0.75
+                            
+                        # Add other score fields as attributes
+                        if not hasattr(points[i], '_rankingScore'):
+                            setattr(points[i], '_rankingScore', points[i].score)
+                        if not hasattr(points[i], '_score'):
+                            setattr(points[i], '_score', points[i].score)
+            
+            # Format results with improved preview
+            return TextProcessor.format_search_results(
+                points, query, search_type, processor, context_size,
+                retriever=context_retriever,
+                db_type="meilisearch"
+            )
+            
+        except Exception as e:
+            print(f"Error during search: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return {"error": str(e)}
+            
     def search_sparse(self, query: str, processor: Any, limit: int, score_threshold: float = None,
                     rerank: bool = False, reranker_type: str = None):
         """
         Perform sparse vector search.
+        
+        Meilisearch doesn't natively support sparse vectors, so we simulate it using sparse_terms.
         """
         if processor is None:
             return {"error": "Sparse search requires an embedding model"}
         
         try:
-            # Generate sparse vector from query
+            # Generate sparse vector for the query
             sparse_indices, sparse_values = processor.get_sparse_embedding(query)
             
             if self.verbose:
@@ -1172,353 +1944,6 @@ class MeilisearchManager(VectorDBInterface):
                 print(f"Error in sparse search: {e}")
                 print("Falling back to keyword search")
             return self.search_keyword(query, limit)
-        
-    def debug_index_content(self):
-        """
-        Debug method to check what's actually in the index.
-        """
-        try:
-            if not self.index:
-                print("No index available")
-                return
-                
-            print("Analyzing index content:")
-            
-            # Get index stats
-            try:
-                stats = self.index.get_stats()
-                
-                # Try to get the document count
-                doc_count = 0
-                if hasattr(stats, "number_of_documents"):
-                    doc_count = stats.number_of_documents
-                    print(f"Index contains {doc_count} documents")
-                else:
-                    print("Could not find document count attribute")
-                    print(f"Available attributes: {dir(stats)}")
-            except Exception as e:
-                print(f"Error getting stats: {e}")
-                
-            # Try to get random samples from the index to check content
-            try:
-                # Search with empty query to get some documents
-                results = self.index.search('', {'limit': 5})
-                
-                # Extract hits
-                hits = []
-                if hasattr(results, 'hits'):
-                    hits = results.hits
-                elif isinstance(results, dict) and 'hits' in results:
-                    hits = results['hits']
-                    
-                if hits and len(hits) > 0:
-                    print(f"Found {len(hits)} sample documents")
-                    
-                    # Show attributes in the first document
-                    if isinstance(hits[0], dict):
-                        print(f"Sample document attributes: {list(hits[0].keys())}")
-                        
-                        # Check for content and sparse_terms
-                        if 'content' in hits[0]:
-                            content_preview = hits[0]['content'][:100] + "..." if len(hits[0]['content']) > 100 else hits[0]['content']
-                            print(f"Content preview: {content_preview}")
-                            
-                        if 'sparse_terms' in hits[0]:
-                            sparse_preview = hits[0]['sparse_terms'][:100] + "..." if len(hits[0]['sparse_terms']) > 100 else hits[0]['sparse_terms']
-                            print(f"Sparse terms preview: {sparse_preview}")
-                    else:
-                        print(f"Sample document type: {type(hits[0])}")
-                else:
-                    print("No sample documents found")
-            except Exception as e:
-                print(f"Error getting sample documents: {e}")
-                
-            # Check searchable attributes configuration
-            try:
-                settings = self.index.get_settings()
-                
-                if isinstance(settings, dict):
-                    if 'searchableAttributes' in settings:
-                        print(f"Searchable attributes: {settings['searchableAttributes']}")
-                else:
-                    if hasattr(settings, 'searchable_attributes'):
-                        print(f"Searchable attributes: {settings.searchable_attributes}")
-                    elif hasattr(settings, 'searchableAttributes'):
-                        print(f"Searchable attributes: {settings.searchableAttributes}")
-            except Exception as e:
-                print(f"Error getting settings: {e}")
-                
-        except Exception as e:
-            print(f"Overall error in debug method: {e}")
-    
-    def search_keyword(self, query: str, limit: int = 10, score_threshold: float = None,
-                    rerank: bool = False, reranker_type: str = None):
-        """
-        Keyword search with improved scoring.
-        """
-        try:
-            if not query.strip():
-                return {"error": "Empty query"}
-            
-            # First, ensure the text field is searchable
-            if self.verbose:
-                print("\n=== FIXING INDEX CONFIGURATION ===")
-                try:
-                    # Get current settings
-                    settings = self.index.get_settings()
-                    searchable_attrs = []
-                    
-                    if isinstance(settings, dict) and 'searchableAttributes' in settings:
-                        searchable_attrs = settings['searchableAttributes']
-                    elif hasattr(settings, 'searchableAttributes'):
-                        searchable_attrs = settings.searchableAttributes
-                    elif hasattr(settings, 'searchable_attributes'):
-                        searchable_attrs = settings.searchable_attributes
-                        
-                    # Check if 'text' is already in searchableAttributes
-                    if 'text' not in searchable_attrs and '*' not in searchable_attrs:
-                        print("Adding 'text' to searchable attributes")
-                        
-                        # Add 'text' to searchable attributes
-                        if isinstance(searchable_attrs, list):
-                            searchable_attrs.append('text')
-                        else:
-                            # Convert to list if needed
-                            searchable_attrs = list(searchable_attrs)
-                            searchable_attrs.append('text')
-                        
-                        # Update the settings
-                        if isinstance(settings, dict):
-                            settings['searchableAttributes'] = searchable_attrs
-                            task = self.index.update_settings(settings)
-                            print("Index settings updated - waiting for task to complete")
-                            self._wait_for_task(task)
-                            print("Index settings update completed")
-                        else:
-                            # Handle object-style settings
-                            settings_dict = {'searchableAttributes': searchable_attrs}
-                            task = self.index.update_settings(settings_dict)
-                            print("Index settings updated - waiting for task to complete")
-                            self._wait_for_task(task)
-                            print("Index settings update completed")
-                    else:
-                        print("'text' is already searchable or all attributes are searchable")
-                except Exception as e:
-                    print(f"Error updating index settings: {e}")
-                    print("Proceeding with search using current configuration")
-                    
-                print("=== END INDEX CONFIGURATION ===\n")
-            
-            # Now search directly in the text field
-            if self.verbose:
-                print(f"Executing search for '{query}' using 'text' field")
-                
-            text_params = {
-                'limit': limit * 3,
-                'attributesToRetrieve': ['*'],
-                'attributesToSearchOn': ['text'],
-                'attributesToHighlight': ['text'],
-                'highlightPreTag': '<<<HIGHLIGHT>>>',
-                'highlightPostTag': '<<<END_HIGHLIGHT>>>',
-                'showMatchesPosition': True,
-                'showRankingScore': True
-            }
-            
-            try:
-                results = self.index.search(query, text_params)
-                
-                # Extract hits
-                hits = []
-                if hasattr(results, 'hits'):
-                    hits = results.hits
-                elif isinstance(results, dict) and 'hits' in results:
-                    hits = results['hits']
-                    
-                if hits and len(hits) > 0:
-                    if self.verbose:
-                        print(f"Found {len(hits)} results searching in 'text' field")
-                        
-                    # Adapt results with proper scoring
-                    adapted_hits = [self._adapt_meilisearch_result(hit, query) for hit in hits]
-                    
-                    # Sort by score
-                    adapted_hits.sort(key=lambda x: x.get('score', 0), reverse=True)
-                    
-                    return adapted_hits[:limit]
-            except Exception as e:
-                if self.verbose:
-                    print(f"Error during search: {e}")
-                    
-            return []
-            
-        except Exception as e:
-            if self.verbose:
-                print(f"Error in keyword search: {e}")
-                import traceback
-                traceback.print_exc()
-            return {"error": f"Error in keyword search: {str(e)}"}
-        
-    def _check_embedder_configured(self, embedder_name):
-        """Check if an embedder is configured in the index"""
-        try:
-            # Get current settings
-            settings = self.index.get_settings()
-            
-            # Check if embedders are configured
-            if isinstance(settings, dict):
-                if 'embedders' in settings:
-                    return embedder_name in settings['embedders']
-            elif hasattr(settings, 'embedders'):
-                embedders = settings.embedders
-                return embedder_name in embedders
-                
-            return False
-        except Exception as e:
-            if self.verbose:
-                print(f"Error checking embedder configuration: {e}")
-            return False
-        
-    def _format_final_results(self, results, query=None):
-        """
-        Format the final results to ensure scores are properly displayed.
-        This method ensures a consistent structure across all search types.
-        """
-        formatted = []
-        
-        for result in results:
-            # Create a new clean result dictionary
-            formatted_result = {}
-            
-            # Copy ID (handle both dict and object cases)
-            if isinstance(result, dict):
-                formatted_result['id'] = result.get('id', '')
-            else:
-                formatted_result['id'] = getattr(result, 'id', '')
-            
-            # Copy or set score (handle both dict and object cases)
-            if isinstance(result, dict):
-                formatted_result['score'] = result.get('score', 0.75)
-            else:
-                formatted_result['score'] = getattr(result, 'score', 0.75)
-            
-            # Copy content/text field (handle both dict and object cases)
-            if isinstance(result, dict):
-                if 'text' in result:
-                    formatted_result['text'] = result['text']
-                    # Also copy to content for compatibility
-                    formatted_result['content'] = result['text']
-                elif 'content' in result:
-                    formatted_result['content'] = result['content']
-                    # Also copy to text for compatibility
-                    formatted_result['text'] = result['content']
-            else:
-                if hasattr(result, 'text'):
-                    formatted_result['text'] = result.text
-                    formatted_result['content'] = result.text
-                elif hasattr(result, 'content'):
-                    formatted_result['content'] = result.content
-                    formatted_result['text'] = result.content
-            
-            # Copy all other fields (handle both dict and object cases)
-            if isinstance(result, dict):
-                for k, v in result.items():
-                    if k not in formatted_result and k != 'payload':
-                        formatted_result[k] = v
-            else:
-                for attr in dir(result):
-                    if not attr.startswith('_') and not callable(getattr(result, attr)) and attr not in formatted_result and attr != 'payload':
-                        formatted_result[attr] = getattr(result, attr)
-            
-            # Set score in multiple places for compatibility
-            formatted_result['_rankingScore'] = formatted_result['score']
-            formatted_result['_score'] = formatted_result['score']
-            formatted_result['rankingScore'] = formatted_result['score']
-            
-            # Create payload with all fields
-            formatted_result['payload'] = {}
-            for k, v in formatted_result.items():
-                if k != 'payload':
-                    formatted_result['payload'][k] = v
-            
-            # Add directly without filtering
-            formatted.append(formatted_result)
-        
-        # Sort by score for consistent ranking
-        formatted.sort(key=lambda x: x.get('score', 0), reverse=True)
-        
-        if self.verbose:
-            print(f"Final formatted results: {len(formatted)}")
-            for i, r in enumerate(formatted[:3]):
-                print(f"  Top {i+1}: score={r.get('score', 0)}, id={r.get('id', '')[:20]}...")
-                
-        return formatted
-        
-    def _configure_embedder(self, embedder_name, model_id):
-        """Configure an embedder for the index"""
-        try:
-            # Create embedder configuration
-            embedder_settings = {
-                embedder_name: {
-                    'source': 'ollama',
-                    'url': 'http://localhost:11434/api/embeddings',
-                    'model': model_id,
-                    'documentTemplate': '{{doc.text}}'  # Use text field, not content
-                }
-            }
-            
-            # Try to update embedders
-            try:
-                task = self.index.update_embedders(embedder_settings)
-                self._wait_for_task(task)
-                return True
-            except AttributeError:
-                # Fall back to direct API call for older clients
-                import requests
-                response = requests.patch(
-                    f"{self.url}/indexes/{self.collection_name}/settings/embedders",
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {self.api_key}" if self.api_key else None
-                    },
-                    json=embedder_settings
-                )
-                
-                return response.status_code in (200, 202)
-                
-        except Exception as e:
-            if self.verbose:
-                print(f"Error configuring embedder: {e}")
-            return False
-
-        
-    def _rerank_results(self, query: str, hits: List[Dict], processor: Any, limit: int, reranker_type: str = None):
-        """
-        Rerank search results using the given processor.
-        
-        Args:
-            query: Original search query
-            hits: List of search hits from Meilisearch
-            processor: Document processor with embedding capabilities
-            limit: Number of results to return
-            reranker_type: Type of reranker to use
-            
-        Returns:
-            Reranked list of hits
-        """
-        try:
-            # Convert hits to format expected by reranker
-            adapted_hits = [self._adapt_meilisearch_result(hit) for hit in hits]
-            
-            # Use the common reranking algorithm
-            reranked_hits = SearchAlgorithms.rerank_results(query, adapted_hits, processor, limit, self.verbose)
-            
-            # Return the reranked hit objects
-            return reranked_hits[:limit]
-        except Exception as e:
-            if self.verbose:
-                print(f"Error during reranking: {e}")
-            # Fall back to original hits if reranking fails
-            return hits[:limit]
     
     def _retrieve_context_for_chunk(self, file_path: str, chunk_index: int, window: int = 1) -> str:
         """
@@ -1608,16 +2033,21 @@ class MeilisearchManager(VectorDBInterface):
             # Prepare documents for update
             documents = []
             for doc_id, embedding, payload in id_embedding_payload_tuples:
+                # Get the embedder model ID from the payload or use default
+                embedder_model_id = payload.get("metadata", {}).get("embedder", self.dense_model_id)
+                
+                # Get the standardized embedder name for this model
+                embedder_name = self.get_embedder_name(embedder_model_id)
+                
                 # Create document with updated data
                 document = {
                     'id': doc_id,
                     **payload  # Include all payload fields
                 }
                 
-                # Add embedding as _vectors field for Meilisearch
-                vector_name = self._sanitize_model_name(self.dense_model_id)
+                # Add embedding as _vectors field
                 document['_vectors'] = {
-                    vector_name: embedding.tolist()
+                    embedder_name: embedding.tolist()
                 }
                 
                 documents.append(document)
@@ -1854,3 +2284,185 @@ class MeilisearchManager(VectorDBInterface):
             if self.verbose:
                 print(f"Error getting document: {e}")
             return {}
+
+    def list_embedders(self) -> List[str]:
+        """
+        List all configured embedder names in the index.
+        
+        Returns:
+            List of embedder names
+        """
+        try:
+            # Get existing embedders
+            existing_embedders = self._get_existing_embedders()
+            
+            # Return the embedder names
+            return list(existing_embedders.keys())
+        except Exception as e:
+            if self.verbose:
+                print(f"Error listing embedders: {e}")
+            return []
+    
+    def verify_embedder_compatibility(self, processor: Any) -> bool:
+        """
+        Verify that the embedder from the processor is compatible with
+        the index.
+        
+        Args:
+            processor: Document processor with embedding capabilities
+            
+        Returns:
+            True if compatible, False otherwise
+        """
+        try:
+            # Get the model ID from the processor
+            dense_model_id = getattr(processor, 'dense_model_id', self.dense_model_id)
+            
+            # Get the standardized embedder name for this model
+            embedder_name = self.get_embedder_name(dense_model_id)
+            
+            # Verify that this embedder exists in the index
+            existing_embedders = self._get_existing_embedders()
+            
+            # Check if embedder exists
+            compatible = embedder_name in existing_embedders
+            
+            if self.verbose:
+                if compatible:
+                    print(f"Processor embedder '{embedder_name}' is compatible with the index")
+                else:
+                    print(f"Warning: Processor embedder '{embedder_name}' is not configured in the index")
+                    print(f"Available embedders: {list(existing_embedders.keys())}")
+                    if existing_embedders:
+                        print(f"Will need to fall back to an available embedder during search")
+                    else:
+                        print(f"No embedders available, search will fall back to keyword search")
+            
+            return compatible
+        except Exception as e:
+            if self.verbose:
+                print(f"Error verifying embedder compatibility: {e}")
+            return False
+    
+    def add_embedder(self, model_id: str, vector_dim: int) -> bool:
+        """
+        Add a new embedder configuration for a model ID.
+        
+        Args:
+            model_id: The model identifier
+            vector_dim: The vector dimension
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Generate embedder name
+            embedder_name = self.get_embedder_name(model_id)
+            
+            # Check if embedder already exists
+            existing_embedders = self._get_existing_embedders()
+            if embedder_name in existing_embedders:
+                if self.verbose:
+                    print(f"Embedder '{embedder_name}' already exists")
+                return True
+            
+            # Create embedder configuration
+            embedder_settings = {
+                embedder_name: {
+                    'source': 'userProvided',
+                    'dimensions': vector_dim
+                }
+            }
+            
+            if self.verbose:
+                print(f"Adding new embedder '{embedder_name}' with dimensions: {vector_dim}")
+            
+            # Update embedders
+            self._update_embedders(embedder_settings)
+            
+            return True
+        except Exception as e:
+            if self.verbose:
+                print(f"Error adding embedder: {e}")
+            return False
+            
+    def debug_vector_storage(self, document_id: str = None) -> Dict[str, Any]:
+        """
+        Debug the vector storage for a particular document or general configuration.
+        
+        Args:
+            document_id: Optional document ID to examine
+            
+        Returns:
+            Debug information
+        """
+        debug_info = {
+            "index_exists": False,
+            "embedders": {},
+            "document_count": 0
+        }
+        
+        try:
+            if not self.index:
+                debug_info["error"] = "Index not initialized"
+                return debug_info
+                
+            debug_info["index_exists"] = True
+            
+            # Get embedder configurations
+            embedders = self._get_existing_embedders()
+            debug_info["embedders"] = embedders
+            
+            # Get document count
+            try:
+                stats = self.index.get_stats()
+                
+                if hasattr(stats, "number_of_documents"):
+                    debug_info["document_count"] = stats.number_of_documents
+                elif isinstance(stats, dict) and "numberOfDocuments" in stats:
+                    debug_info["document_count"] = stats["numberOfDocuments"]
+            except Exception as e:
+                debug_info["stats_error"] = str(e)
+            
+            # If document ID is provided, get that document
+            if document_id:
+                try:
+                    document = self.index.get_document(document_id)
+                    
+                    # Create a safe version of the document for debug output
+                    safe_doc = {}
+                    
+                    if isinstance(document, dict):
+                        # For each field, either copy it or summarize it if it's large
+                        for k, v in document.items():
+                            if k == '_vectors':
+                                # For vectors, just show which embedders are present
+                                if isinstance(v, dict):
+                                    safe_doc['_vectors'] = {embedder: f"[Vector with {len(vec)} elements]" 
+                                                          for embedder, vec in v.items()}
+                                else:
+                                    safe_doc['_vectors'] = f"[Unexpected format: {type(v)}]"
+                            elif k == 'content' or k == 'text':
+                                # For content/text, show a preview
+                                if isinstance(v, str):
+                                    safe_doc[k] = v[:100] + "..." if len(v) > 100 else v
+                                else:
+                                    safe_doc[k] = f"[Unexpected format: {type(v)}]"
+                            else:
+                                # For other fields, copy directly
+                                safe_doc[k] = v
+                    else:
+                        safe_doc["error"] = f"Document is not a dictionary: {type(document)}"
+                    
+                    debug_info["document"] = safe_doc
+                except Exception as e:
+                    debug_info["document_error"] = str(e)
+            
+            # Get embedder name mapping
+            debug_info["embedder_name_map"] = self.embedder_name_map
+            
+            return debug_info
+            
+        except Exception as e:
+            debug_info["error"] = str(e)
+            return debug_info
