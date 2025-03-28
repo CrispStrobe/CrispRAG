@@ -1,3 +1,4 @@
+# lancedb_manager.py:
 import os
 import time
 import json
@@ -11,23 +12,22 @@ import numpy as np
 from vector_db_interface import VectorDBInterface
 from utils import SearchAlgorithms, TextProcessor, ResultProcessor
 
-# Try to import LanceDB client
+# Try to import LanceDB client with the correct rerankers
 try:
     import lancedb
     import pyarrow as pa
     from lancedb.rerankers import (
-        RRFReranker, 
-        LinearCombinationReranker,
-        CombineReranker,
+        RRFReranker,  # Default reranker for hybrid search
         CrossEncoderReranker,
-        ColbertReranker,
+        ColbertReranker,  # Recommended reranker
         CohereReranker,
         JinaReranker
+        # Note: LinearCombinationReranker is deprecated according to docs
     )
     lancedb_available = True
-except ImportError:
+except Exception as e:
+    print(f"Warning: LanceDB or PyArrow not available: {e}")
     lancedb_available = False
-
 
 class LanceDBManager(VectorDBInterface):
     """Manager for LanceDB vector database operations with enhanced retrieval performance"""
@@ -55,10 +55,19 @@ class LanceDBManager(VectorDBInterface):
         if not lancedb_available:
             raise ImportError("LanceDB client not available. Install with: pip install lancedb pyarrow")
             
+        # If no URI is provided, create a local database at storage_path
+        # If neither URI nor storage_path is provided, create a local database in the current working directory
         self.uri = uri
         self.collection_name = collection_name
         self.vector_dim = vector_size
-        self.storage_path = storage_path if storage_path else os.path.join(os.getcwd(), "lancedb_storage")
+        
+        # If storage_path is not provided but we don't have a URI, use a default path
+        if storage_path is None and uri is None:
+            storage_path = os.path.join(os.getcwd(), "lancedb_storage")
+            if verbose:
+                print(f"No URI or storage_path provided. Using default path: {storage_path}")
+        
+        self.storage_path = storage_path
         self.verbose = verbose
         self.db = None
         self.table = None
@@ -81,19 +90,19 @@ class LanceDBManager(VectorDBInterface):
         self.connect()
 
     def connect(self) -> None:
-        """Establish connection to LanceDB"""
+        """Establish connection to LanceDB with improved error handling"""
         try:
             # Connect to LanceDB using URI if provided, otherwise use local storage
-            uri = self.uri if self.uri else self.storage_path
+            conn_uri = self.uri if self.uri else self.storage_path
             
             # Make sure the directory exists for local storage
-            if not self.uri:
+            if not self.uri and self.storage_path:
                 os.makedirs(self.storage_path, exist_ok=True)
                 
             if self.verbose:
-                print(f"Connecting to LanceDB at {uri}")
+                print(f"Connecting to LanceDB at {conn_uri}")
                 
-            self.db = lancedb.connect(uri)
+            self.db = lancedb.connect(conn_uri)
             
             # Try to open existing collection if it exists
             try:
@@ -146,22 +155,32 @@ class LanceDBManager(VectorDBInterface):
                 print(f"Could not check existing indexes: {e}")
         
     def create_collection(self, recreate: bool = False) -> None:
-        """Create or recreate a LanceDB collection with vector and text indexes"""
+        """Create or recreate a LanceDB collection with improved reliability"""
         try:
+            # Ensure connection is active
+            if self.db is None:
+                self.connect()
+                
             # Check if collection exists
             collection_exists = False
             try:
                 self.table = self.db.open_table(self.collection_name)
                 collection_exists = True
-            except:
+            except Exception as e:
+                if self.verbose:
+                    print(f"Collection does not exist: {e}")
                 pass
 
             if collection_exists:
                 if recreate:
                     if self.verbose:
                         print(f"Recreating collection '{self.collection_name}'...")
-                    self.db.drop_table(self.collection_name)
-                    self.table = None
+                    try:
+                        self.db.drop_table(self.collection_name)
+                        self.table = None
+                    except Exception as e:
+                        print(f"Warning: Error dropping table: {e}")
+                        # Continue anyway as we'll overwrite it
                 else:
                     if self.verbose:
                         print(f"Collection '{self.collection_name}' already exists.")
@@ -185,116 +204,152 @@ class LanceDBManager(VectorDBInterface):
                 pa.field("metadata", pa.string())  # JSON string for metadata
             ])
 
-            # Create the table
-            self.table = self.db.create_table(
-                self.collection_name,
-                schema=schema,
-                mode="overwrite" if recreate else "create"
-            )
+            # Create the table with proper error handling
+            try:
+                self.table = self.db.create_table(
+                    self.collection_name,
+                    schema=schema,
+                    mode="overwrite" if recreate else "create"
+                )
+                
+                # Always double-check the table was created and accessible
+                if self.table is None:
+                    raise ValueError(f"Table creation failed - returned None")
+                    
+                # Verify we can access the table
+                self.table.schema
+                
+                if self.verbose:
+                    print(f"Successfully created collection '{self.collection_name}'")
+                    
+            except Exception as e:
+                print(f"Error during table creation: {e}")
+                # Try to recover by opening the table if it might have been created
+                try:
+                    self.table = self.db.open_table(self.collection_name)
+                    if self.verbose:
+                        print(f"Recovered by opening existing table")
+                except Exception as e2:
+                    print(f"Failed to recover: {e2}")
+                    raise ValueError(f"Could not create or open table: {e}")
 
-            # Create vector index for similarity search
-            if self.verbose:
-                print("Creating vector index...")
-                
-            self.table.create_index(
-                ["vector"], 
-                index_type="IVF_PQ", 
-                metric="cosine",
-                replace=True
-            )
-            self.has_vector_index = True
-            
-            # Create full-text search index
-            if self.verbose:
-                print("Creating full-text search index...")
-                
-            # Use more advanced FTS configuration
-            self.table.create_fts_index(
-                "text", 
-                replace=True,
-                with_position=True,  # Enable phrase queries
-                lower_case=True,     # Case-insensitive search
-                stem=True,           # Enable stemming
-                remove_stop_words=True  # Remove common stop words
-            )
-            self.has_fts_index = True
-            
-            # Create scalar indices for efficient filtering
-            if self.verbose:
-                print("Creating scalar indices for efficient filtering...")
-                
-            self.table.create_scalar_index("file_path")
-            self.table.create_scalar_index("chunk_index")
-            self.has_scalar_indexes = True
+            # For empty tables, we'll defer index creation until data is inserted
+            # Set flags to indicate indexes haven't been created yet
+            self.has_vector_index = False
+            self.has_fts_index = False
+            self.has_scalar_indexes = False
             
             if self.verbose:
-                print(f"✅ Collection '{self.collection_name}' created successfully with indexes")
-                
-            # Wait for indexes to be ready
-            self._wait_for_indexes()
+                print(f"✅ Collection '{self.collection_name}' created successfully")
+                print("Note: Indexes will be created after data insertion")
 
         except Exception as e:
             print(f"❌ Error creating collection '{self.collection_name}': {str(e)}")
             raise
+        
             
-    def _wait_for_indexes(self, timeout=300, poll_interval=10):
-        """Wait for indexes to be ready"""
+    def _wait_for_indexes(self, timeout=60, poll_interval=5):
+        """
+        Wait for indexes to be ready with improved feedback
+        
+        Args:
+            timeout: Maximum time to wait in seconds
+            poll_interval: How often to check status in seconds
+        """
         if not self.verbose:
             return
             
-        print("Waiting for indexes to be ready...")
+        print("Checking index status...")
         
         start_time = time.time()
         while time.time() - start_time < timeout:
             try:
                 indices = self.table.list_indices()
+                
                 if not indices:
+                    print("⏳ No indexes found yet, waiting...")
                     time.sleep(poll_interval)
                     continue
                     
-                # Check if we have vector and FTS indexes
-                has_vector = any(idx.get("type", "") in ["IVF_PQ", "HNSW", "IVF_FLAT"] for idx in indices)
-                has_fts = any(idx.get("type", "") == "FULLTEXT" for idx in indices)
+                # Get status of all indexes
+                incomplete_indexes = []
+                complete_indexes = []
                 
-                if has_vector and has_fts:
-                    # Check if indices are fully built
-                    all_ready = True
-                    for idx in indices:
-                        idx_name = idx.get("name", "")
-                        try:
-                            stats = self.table.index_stats(idx_name)
-                            if stats.num_unindexed_rows > 0:
-                                all_ready = False
-                                break
-                        except:
-                            all_ready = False
-                            break
+                for idx in indices:
+                    idx_name = idx.name
+                    try:
+                        stats = self.table.index_stats(idx_name)
+                        if hasattr(stats, 'num_unindexed_rows') and stats.num_unindexed_rows > 0:
+                            # This index is still processing
+                            incomplete_indexes.append((idx_name, stats.num_unindexed_rows))
+                        else:
+                            # This index is done
+                            complete_indexes.append(idx_name)
+                    except:
+                        # Can't get stats for this index yet
+                        incomplete_indexes.append((idx_name, "unknown"))
+                
+                if incomplete_indexes:
+                    # Some indexes still building
+                    status_str = ", ".join([f"{name}({rows} rows left)" for name, rows in incomplete_indexes])
+                    print(f"⏳ Still building indexes: {status_str}")
+                else:
+                    # All indexes complete
+                    print(f"✅ All {len(complete_indexes)} indexes are ready!")
+                    return
                     
-                    if all_ready:
-                        print("All indexes are ready.")
-                        return
             except Exception as e:
                 print(f"Error checking index status: {e}")
             
-            print(f"⏳ Waiting for indexes to be ready... ({int(time.time() - start_time)}s)")
             time.sleep(poll_interval)
             
         print("⚠️ Timeout waiting for indexes to be ready. Continuing anyway.")
+        print("Indexes will continue building in the background.")
 
     def get_collection_info(self) -> Dict[str, Any]:
-        """Get information about the collection"""
+        """Get information about the collection with compatibility fixes for API changes"""
         try:
             if not self.db or not self.table:
                 return {"error": "Not connected to LanceDB or collection not found"}
                 
             # Get statistics about the table
+            row_count = 0
             try:
-                stats = self.table.stats()
-                row_count = stats.get("num_rows", 0)
+                # Try the stats() method first (may not exist in newer versions)
+                try:
+                    stats = self.table.stats()
+                    row_count = stats.get("num_rows", 0)
+                except AttributeError:
+                    # stats() doesn't exist, try counting with SQL
+                    count_result = self.table.sql("SELECT COUNT(*) as count FROM data").to_arrow()
+                    if hasattr(count_result, 'to_pandas'):
+                        row_count = count_result.to_pandas()["count"].iloc[0]
+                    else:
+                        row_count = count_result["count"][0]
             except:
-                # Fall back to counting rows manually
-                df = self.table.to_pandas(columns=["id"])
-                row_count = len(df)
+                # Last resort: try to count by retrieving all rows
+                try:
+                    # Try with to_arrow() first
+                    data = self.table.to_arrow()
+                    row_count = len(data)
+                except:
+                    # Fall back to loading a small sample
+                    try:
+                        # Different versions have different APIs for to_pandas
+                        try:
+                            df = self.table.to_pandas(limit=10)
+                        except TypeError:
+                            # If limit is not supported, try without it
+                            # Note: this could be slow for large tables
+                            df = self.table.to_pandas()
+                            
+                        # Just note we have some data but not the exact count
+                        if len(df) > 0:
+                            row_count = "some data available (count unknown)"
+                        else:
+                            row_count = 0
+                    except:
+                        row_count = "unknown"
             
             # Get disk usage if possible
             disk_usage = None
@@ -307,26 +362,32 @@ class LanceDBManager(VectorDBInterface):
                     if self.verbose:
                         print(f"Could not calculate disk usage: {str(e)}")
             
-            # Get table schema and index information
-            schema = self.table.schema()
+            # Get table schema - FIX: access schema as a property, not a method
+            try:
+                schema = self.table.schema
+                schema_str = str(schema)
+            except Exception as schema_err:
+                if self.verbose:
+                    print(f"Error accessing schema: {schema_err}")
+                schema_str = "schema unavailable"
             
             # Get index information
             indexes = {}
             try:
                 index_info = self.table.list_indices()
                 for idx in index_info:
-                    idx_name = idx.get("name", "unknown")
-                    idx_type = idx.get("type", "unknown")
-                    idx_column = idx.get("column", "unknown")
+                    idx_name = idx.name
+                    idx_type = getattr(idx, 'type', 'unknown')
+                    idx_column = getattr(idx, 'column', 'unknown')
                     indexes[idx_name] = {"type": idx_type, "column": idx_column}
-                    
+                        
                     # Get additional index stats if available
                     try:
                         idx_stats = self.table.index_stats(idx_name)
                         indexes[idx_name]["stats"] = {
-                            "indexed_rows": idx_stats.num_indexed_rows,
-                            "unindexed_rows": idx_stats.num_unindexed_rows,
-                            "distance_type": getattr(idx_stats, "distance_type", None)
+                            "indexed_rows": getattr(idx_stats, 'num_indexed_rows', 'unknown'),
+                            "unindexed_rows": getattr(idx_stats, 'num_unindexed_rows', 'unknown'),
+                            "distance_type": getattr(idx_stats, 'distance_type', None)
                         }
                     except:
                         pass
@@ -343,7 +404,7 @@ class LanceDBManager(VectorDBInterface):
                 "name": self.collection_name,
                 "points_count": row_count,
                 "disk_usage": disk_usage,
-                "schema": str(schema),
+                "schema": schema_str,
                 "indexes": indexes,
                 "vector_dim": self.vector_dim,
                 "dense_model": self.dense_model_id,
@@ -412,21 +473,44 @@ class LanceDBManager(VectorDBInterface):
             if self.verbose:
                 print(f"Successfully inserted {len(rows)} points")
                 
-            # Make sure we have appropriate indexes
+            # Now that we have data, create indexes if needed
             self._ensure_indexes()
         except Exception as e:
             print(f"Error inserting embeddings: {str(e)}")
             raise
 
     def insert_embeddings_with_sparse(self, embeddings_with_sparse: List[Tuple[np.ndarray, Dict[str, Any], Tuple[List[int], List[float]]]]) -> None:
-        """Insert embeddings with sparse vectors into LanceDB"""
+        """Insert embeddings with sparse vectors into LanceDB with improved error handling"""
         if not embeddings_with_sparse:
             return
             
         try:
-            if not self.table:
-                raise ValueError(f"Collection '{self.collection_name}' not found or not initialized")
-                
+            # Check if table is accessible and reconnect if needed
+            if self.table is None:
+                if self.verbose:
+                    print(f"Table not initialized, attempting to reconnect and open")
+                try:
+                    self.connect()
+                    try:
+                        self.table = self.db.open_table(self.collection_name)
+                    except Exception as open_err:
+                        if self.verbose:
+                            print(f"Could not open table: {open_err}")
+                        # If we can't open it, try to create it
+                        self.create_collection(recreate=False)
+                except Exception as conn_err:
+                    print(f"Failed to reconnect: {conn_err}")
+                    raise ValueError(f"Collection '{self.collection_name}' not found or not initialized")
+            
+            # Verify table is accessible by checking schema
+            try:
+                self.table.schema
+            except Exception as schema_err:
+                if self.verbose:
+                    print(f"Table connection lost, attempting to reconnect: {schema_err}")
+                self.connect()
+                self.table = self.db.open_table(self.collection_name)
+            
             # Prepare data for insertion
             rows = []
             for embedding, payload, sparse_vector in embeddings_with_sparse:
@@ -467,80 +551,271 @@ class LanceDBManager(VectorDBInterface):
                 if self.verbose and len(rows) > BATCH_SIZE:
                     print(f"Inserting batch {i//BATCH_SIZE + 1}/{(len(rows)-1)//BATCH_SIZE + 1} ({len(batch)} points)")
                 
-                self.table.add(batch)
+                try:
+                    self.table.add(batch)
+                except Exception as add_err:
+                    print(f"Error adding batch: {add_err}")
+                    # Try to reconnect and add again
+                    self.connect()
+                    self.table = self.db.open_table(self.collection_name)
+                    self.table.add(batch)
                 
             if self.verbose:
                 print(f"Successfully inserted {len(rows)} points with sparse vectors")
                 
-            # Make sure we have appropriate indexes
+            # Now that we have data, create indexes if needed
             self._ensure_indexes()
         except Exception as e:
             print(f"Error inserting embeddings with sparse vectors: {str(e)}")
             raise
             
+
     def _ensure_indexes(self):
-        """Ensure that necessary indexes exist"""
+        """Create indexes if they don't exist and we have data in the table with improved API compatibility"""
         try:
-            # Check if we have necessary indexes
-            indices = self.table.list_indices()
-            
+            # First check if we have any data in the table and how much
+            data_count = 0
+            try:
+                # Try to get data count with SQL
+                try:
+                    # Use SQL to count rows efficiently
+                    count_result = self.table.sql("SELECT COUNT(*) as count FROM data").to_arrow()
+                    if hasattr(count_result, 'to_pandas'):
+                        data_count = int(count_result.to_pandas()["count"].iloc[0])
+                    else:
+                        data_count = int(count_result["count"][0])
+                        
+                    if self.verbose:
+                        print(f"Table has {data_count} rows")
+                except:
+                    # Fallback method - count by sampling
+                    try:
+                        # Use to_arrow with limit parameter (newer API)
+                        sample_data = self.table.to_arrow(limit=1000)  # Sample up to 1000 rows
+                        sample_count = len(sample_data)
+                        
+                        if sample_count == 1000:
+                            # We hit the limit, so there are at least 1000 rows
+                            data_count = 1000
+                            if self.verbose:
+                                print(f"Table has at least {data_count} rows")
+                        else:
+                            # We got all rows
+                            data_count = sample_count
+                            if self.verbose:
+                                print(f"Table has {data_count} rows")
+                    except TypeError:
+                        # Fallback for older versions - try without limit
+                        try:
+                            all_data = self.table.to_arrow()
+                            data_count = len(all_data)
+                            if self.verbose:
+                                print(f"Table has {data_count} rows")
+                        except:
+                            # Can't determine count
+                            if self.verbose:
+                                print("Table has data (count unknown)")
+                            data_count = 100  # Conservative default
+            except Exception as e:
+                if self.verbose:
+                    print(f"Error checking table data: {e}")
+                data_count = 0
+                
+            if data_count == 0:
+                if self.verbose:
+                    print("Table is empty, skipping index creation")
+                return
+                
             # Check for vector index
-            vector_index = any(idx.get("type", "") in ["IVF_PQ", "HNSW", "IVF_FLAT"] for idx in indices)
-            if not vector_index and not self.has_vector_index:
+            if not self.has_vector_index:
                 if self.verbose:
                     print("Creating vector index...")
-                self.table.create_index(
-                    ["vector"], 
-                    index_type="IVF_PQ", 
-                    metric="cosine",
-                    replace=True
-                )
-                self.has_vector_index = True
+                    
+                try:
+                    # Try to determine GPU acceleration support
+                    gpu_available = False
+                    gpu_type = None
+                    
+                    # Check if PyTorch with CUDA is available
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            gpu_available = True
+                            gpu_type = "cuda"
+                            if self.verbose:
+                                print(f"CUDA is available with {torch.cuda.device_count()} device(s)")
+                                print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+                    except:
+                        pass
+                        
+                    # Check for MPS (Apple Silicon)
+                    if not gpu_available:
+                        try:
+                            import torch
+                            if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                                gpu_available = True
+                                gpu_type = "mps"
+                                if self.verbose:
+                                    print(f"Apple MPS (Metal) acceleration is available")
+                        except:
+                            pass
+                            
+                    # Calculate good parameters based on data size and vector dimension
+                    vector_dim = self.vector_dim  # Usually 384 for BGE models
+                    
+                    # For very small datasets, IVF_PQ doesn't work well
+                    # We need to use IVF_FLAT which has fewer constraints but still 
+                    # provides better performance than brute force
+                    if data_count < 1000:
+                        # For small datasets, use IVF_FLAT
+                        # Calculate optimal number of partitions (clusters)
+                        # For very small datasets, use minimal partitions
+                        num_partitions = max(2, min(data_count // 4, 16))
+                        
+                        if self.verbose:
+                            print(f"Using IVF_FLAT index for small dataset ({data_count} vectors)")
+                            print(f"  - num_partitions: {num_partitions}")
+                            print(f"  - vectors per partition: ~{data_count/num_partitions:.1f}")
+                        
+                        # Create index with appropriate parameters for IVF_FLAT
+                        index_params = {
+                            "vector_column_name": "vector", 
+                            "metric": "cosine",
+                            "replace": True,
+                            "num_partitions": num_partitions,
+                            "index_type": "IVF_FLAT"  # Use FLAT for small datasets
+                        }
+                    else:
+                        # For larger datasets, use IVF_PQ with optimized parameters
+                        # Calculate optimal number of partitions (clusters)
+                        if data_count < 10000:
+                            # For small-medium datasets
+                            num_partitions = int(data_count ** 0.4)  # Slightly less than sqrt
+                        else:
+                            # For larger datasets
+                            # Aim for ~3K vectors per partition
+                            num_partitions = max(10, min(256, data_count // 3000))
+                        
+                        # Calculate optimal number of sub-vectors
+                        # Ensure dimension / num_sub_vectors is a multiple of 8 for SIMD efficiency
+                        # For 384-dim: good values are 48 (384/48=8) or 64 (384/64=6)
+                        # Adjust for different dimensions
+                        if vector_dim % 64 == 0:
+                            num_sub_vectors = 64  # Good for 384, 512, 768, 1024
+                        elif vector_dim % 48 == 0:
+                            num_sub_vectors = 48  # Good for 384, 768
+                        else:
+                            # Find largest divisor that results in multiple of 8
+                            for divisor in [32, 24, 16, 8]:
+                                if vector_dim % divisor == 0:
+                                    num_sub_vectors = divisor
+                                    break
+                            else:
+                                # Fallback: use dimension / 8
+                                num_sub_vectors = max(1, vector_dim // 8)
+                        
+                        if self.verbose:
+                            print(f"Using IVF_PQ index for dataset with {data_count} vectors with {vector_dim} dimensions:")
+                            print(f"  - num_partitions: {num_partitions}")
+                            print(f"  - num_sub_vectors: {num_sub_vectors}")
+                            print(f"  - vectors per partition: ~{data_count/num_partitions:.1f}")
+                            print(f"  - dimension / num_sub_vectors = {vector_dim/num_sub_vectors:.1f}")
+                        
+                        # Create index with appropriate parameters for IVF_PQ
+                        index_params = {
+                            "vector_column_name": "vector", 
+                            "metric": "cosine",
+                            "replace": True,
+                            "num_partitions": num_partitions,
+                            "num_sub_vectors": num_sub_vectors,
+                            "num_bits": 8,  # Explicit: only 4 or 8 supported, 8 is better quality
+                            "index_type": "IVF_PQ"  # Explicitly set index type
+                        }
+                    
+                    # Add accelerator if GPU is available
+                    if gpu_available:
+                        if self.verbose:
+                            print(f"Creating vector index with {gpu_type} acceleration")
+                        index_params["accelerator"] = gpu_type
+                    else:
+                        if self.verbose:
+                            print("Creating vector index with CPU (no GPU acceleration available)")
+                    
+                    # Create the index with all parameters
+                    self.table.create_index(**index_params)
+                        
+                    self.has_vector_index = True
+                    
+                    if self.verbose:
+                        print("Vector index creation initiated")
+                        print("Note: Index building will continue in the background")
+                        
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Error creating vector index: {e}")
+                        print("Will continue without vector index")
             
             # Check for FTS index
-            fts_index = any(idx.get("type", "") == "FULLTEXT" for idx in indices)
-            if not fts_index and not self.has_fts_index:
+            if not self.has_fts_index:
                 if self.verbose:
                     print("Creating full-text search index...")
-                self.table.create_fts_index(
-                    "text", 
-                    replace=True,
-                    with_position=True,
-                    lower_case=True,
-                    stem=True,
-                    remove_stop_words=True
-                )
-                self.has_fts_index = True
+                try:
+                    self.table.create_fts_index(
+                        "text", 
+                        replace=True,
+                        with_position=True,
+                        lower_case=True,
+                        stem=True,
+                        remove_stop_words=True
+                    )
+                    self.has_fts_index = True
+                    if self.verbose:
+                        print("FTS index creation initiated")
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Error creating FTS index: {e}")
+                        print("Will continue without FTS index")
             
             # Check for scalar indexes
-            file_path_index = any(idx.get("column", "") == "file_path" and idx.get("type", "") == "SCALAR" for idx in indices)
-            chunk_index_index = any(idx.get("column", "") == "chunk_index" and idx.get("type", "") == "SCALAR" for idx in indices)
-            
-            if not file_path_index or not chunk_index_index:
-                self.has_scalar_indexes = False
-                
             if not self.has_scalar_indexes:
                 if self.verbose:
                     print("Creating scalar indexes...")
-                    
-                if not file_path_index:
-                    self.table.create_scalar_index("file_path")
-                    
-                if not chunk_index_index:
-                    self.table.create_scalar_index("chunk_index")
-                    
+                
+                # Try to create file_path index (using BTREE which is good for many unique values)
+                try:
+                    self.table.create_scalar_index("file_path", index_type="BTREE")
+                    if self.verbose:
+                        print("Created scalar index on file_path")
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Error creating file_path index: {e}")
+                
+                # Try to create chunk_index (using BTREE for numeric values)
+                try:
+                    self.table.create_scalar_index("chunk_index", index_type="BTREE")
+                    if self.verbose:
+                        print("Created scalar index on chunk_index")
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Error creating chunk_index index: {e}")
+                        
                 self.has_scalar_indexes = True
-        
+                if self.verbose:
+                    print("Scalar indexes creation initiated")
+                    
         except Exception as e:
             if self.verbose:
-                print(f"Warning: Could not ensure indexes: {e}")
+                print(f"Error ensuring indexes: {e}")
+                print("Will continue without additional indexes")
+
+
 
     def _get_reranker(self, reranker_type: str = "rrf", verbose: bool = False):
         """
         Get a reranker instance based on type
         
         Args:
-            reranker_type: Type of reranker to use ('rrf', 'linear', 'dbsf', 'colbert', 'cohere', 'jina', 'cross')
+            reranker_type: Type of reranker to use ('rrf', 'colbert', 'cohere', 'jina', 'cross')
             verbose: Whether to show verbose output
             
         Returns:
@@ -550,23 +825,41 @@ class LanceDBManager(VectorDBInterface):
         
         try:
             if reranker_type == "rrf":
-                return RRFReranker()
-            elif reranker_type == "linear":
-                return LinearCombinationReranker(weight=0.7)  # 0.7 for vector, 0.3 for FTS
-            elif reranker_type == "dbsf":
-                return CombineReranker(normalize="score")
+                # RRF is the default and recommended reranker for hybrid search
+                # k=60 is the default and near-optimal according to the docs
+                return RRFReranker(k=60, return_score="relevance")
+                
             elif reranker_type == "colbert":
-                return ColbertReranker()
+                # ColBERT reranker - good for all search types (hybrid, vector, FTS)
+                return ColbertReranker(
+                    model_name="colbert-ir/colbertv2.0",
+                    column="text",
+                    return_score="relevance"
+                )
+                
+            elif reranker_type == "dbsf" or reranker_type == "fusion":
+                # For DBSF fusion, use RRFReranker as it's more suitable than LinearCombinationReranker
+                if verbose:
+                    print(f"Using RRFReranker for fusion type '{reranker_type}'")
+                return RRFReranker(k=60, return_score="all")  # Return all scores for better fusion
+                
             elif reranker_type == "cohere":
+                # Cohere requires an API key which we don't provide here
+                if verbose:
+                    print("Warning: Cohere reranker requires an API key")
                 return CohereReranker()
+                
             elif reranker_type == "jina":
                 return JinaReranker()
+                
             elif reranker_type == "cross":
                 return CrossEncoderReranker()
+                
             else:
                 if verbose:
                     print(f"Unknown reranker type: {reranker_type}, using RRF")
                 return RRFReranker()
+                
         except Exception as e:
             if verbose:
                 print(f"Error creating reranker '{reranker_type}': {e}")
@@ -587,15 +880,23 @@ class LanceDBManager(VectorDBInterface):
             processor: Document processor with embedding capabilities
             limit: Number of results to return
             prefetch_limit: Number of results to prefetch for fusion
-            fusion_type: Type of fusion to use (rrf, linear, dbsf)
+            fusion_type: Type of fusion to use (rrf or dbsf, with rrf recommended)
             score_threshold: Minimum score threshold
             rerank: Whether to apply additional reranking after fusion
-            reranker_type: Type of reranker to use for final reranking (colbert, cohere, jina, cross)
+            reranker_type: Type of reranker to use for final reranking (colbert recommended, or cohere, jina, cross)
         """
         if processor is None:
             return {"error": "Hybrid search requires an embedding model"}
         
         try:
+            # Ensure we have a working table connection
+            if self.table is None:
+                try:
+                    self.connect()
+                    self.table = self.db.open_table(self.collection_name)
+                except Exception as e:
+                    return {"error": f"Could not connect to table: {e}"}
+            
             # Generate the query embedding
             query_vector = processor.get_embedding(query)
             
@@ -616,84 +917,122 @@ class LanceDBManager(VectorDBInterface):
                 print(f"Performing hybrid search for: '{query}'")
                 print(f"Using {fusion_type} fusion and {reranker_type if rerank else 'no'} reranking")
 
-            # First perform hybrid search with fusion
-            search_results = (
-                self.table.search(
-                    query,
-                    query_type="hybrid"
+            try:
+                # First perform hybrid search with fusion
+                search_results = (
+                    self.table.search(
+                        query,
+                        query_type="hybrid",
+                        # Add fast_search parameter to use available indices
+                        fast_search=True
+                    )
+                    .rerank(reranker=fusion_reranker)  # Apply fusion reranker
+                    .limit(prefetch_limit)              # Get more results than needed
                 )
-                .rerank(reranker=fusion_reranker)  # Apply fusion reranker
-                .limit(prefetch_limit)              # Get more results than needed
-            )
-            
-            # Apply additional reranking if requested
-            if rerank and reranker:
-                search_results = search_results.rerank(reranker=reranker)
-            
-            # Apply score threshold if provided
-            if score_threshold is not None:
-                search_results = search_results.where(f"_distance >= {score_threshold}", prefilter=False)
-            
-            # Limit to final number of results
-            search_results = search_results.limit(limit)
-            
-            # Get the results as pandas DataFrame
-            results_df = search_results.to_pandas()
-            
-            # Record hit rate metrics if available
-            true_context = getattr(processor, 'expected_context', None)
-            if true_context:
-                hit = any(row["text"] == true_context for _, row in results_df.iterrows())
-                search_key = f"hybrid_{fusion_type}"
-                if rerank:
-                    search_key += f"_{reranker_type}"
-                self._record_hit(search_key, hit)
-            
-            # Convert results to the expected format
-            results = []
-            for _, row in results_df.iterrows():
-                # Create a result object (compatible with other backends)
-                class ResultItem:
-                    def __init__(self, id, payload, score):
-                        self.id = id
-                        self.payload = payload
-                        self.score = score
                 
-                # Parse metadata JSON
-                metadata = row.get("metadata", "{}")
-                if isinstance(metadata, str):
+                # Apply additional reranking if requested
+                if rerank and reranker:
+                    search_results = search_results.rerank(reranker=reranker)
+                
+                # Apply score threshold if provided
+                if score_threshold is not None:
+                    search_results = search_results.where(f"_distance >= {score_threshold}", prefilter=False)
+                
+                # Limit to final number of results
+                search_results = search_results.limit(limit)
+                
+                # Get the results as pandas DataFrame, handling API differences
+                try:
+                    # First try with to_pandas() (newer versions)
+                    results_df = search_results.to_pandas()
+                except Exception as e1:
                     try:
-                        metadata = json.loads(metadata)
-                    except:
-                        metadata = {}
+                        # Try with to_arrow().to_pandas() (older versions)
+                        results_arr = search_results.to_arrow()
+                        if hasattr(results_arr, 'to_pandas'):
+                            results_df = results_arr.to_pandas()
+                        else:
+                            # Manual conversion from Arrow to pandas
+                            import pandas as pd
+                            results_df = pd.DataFrame({
+                                col: results_arr[col].to_numpy() 
+                                for col in results_arr.column_names
+                            })
+                    except Exception as e2:
+                        if self.verbose:
+                            print(f"Error converting results: {e1}; then {e2}")
+                        return {"error": "Could not process search results"}
                 
-                # Create payload dictionary
-                payload = {
-                    "text": row["text"],
-                    "file_path": row["file_path"],
-                    "file_name": row["file_name"],
-                    "chunk_index": row["chunk_index"],
-                    "total_chunks": row.get("total_chunks", 0),
-                    "metadata": metadata
-                }
+                # Record hit rate metrics if available
+                true_context = getattr(processor, 'expected_context', None)
+                if true_context:
+                    hit = any(row["text"] == true_context for _, row in results_df.iterrows())
+                    search_key = f"hybrid_{fusion_type}"
+                    if rerank:
+                        search_key += f"_{reranker_type}"
+                    self._record_hit(search_key, hit)
                 
-                # Create result object
-                result = ResultItem(
-                    id=row["id"],
-                    payload=payload,
-                    score=row.get("_distance", 0.0)
-                )
+                # Convert results to the expected format
+                results = []
+                for _, row in results_df.iterrows():
+                    # Create a result object (compatible with other backends)
+                    class ResultItem:
+                        def __init__(self, id, payload, score):
+                            self.id = id
+                            self.payload = payload
+                            self.score = score
+                    
+                    # Parse metadata JSON
+                    metadata = row.get("metadata", "{}")
+                    if isinstance(metadata, str):
+                        try:
+                            metadata = json.loads(metadata)
+                        except:
+                            metadata = {}
+                    
+                    # Create payload dictionary
+                    payload = {
+                        "text": row["text"],
+                        "file_path": row["file_path"],
+                        "file_name": row["file_name"],
+                        "chunk_index": row["chunk_index"],
+                        "total_chunks": row.get("total_chunks", 0),
+                        "metadata": metadata
+                    }
+                    
+                    # Create result object with the score from the appropriate column
+                    # Different versions use different column names
+                    score = 0.0
+                    for score_col in ["_distance", "_relevance_score", "_score", "score"]:
+                        if score_col in row:
+                            score = row[score_col]
+                            break
+                            
+                    result = ResultItem(
+                        id=row["id"],
+                        payload=payload,
+                        score=score
+                    )
+                    
+                    results.append(result)
                 
-                results.append(result)
-            
-            return results
-            
+                return results
+            except Exception as search_err:
+                if self.verbose:
+                    print(f"Hybrid search error: {search_err}")
+                    
+                # If hybrid search fails (possibly missing indexes), fall back to vector-only search
+                if self.verbose:
+                    print("Falling back to vector-only search")
+                return self.search_dense(query, processor, limit, score_threshold, rerank, reranker_type)
+                
         except Exception as e:
             if self.verbose:
                 print(f"Error in hybrid search: {e}")
                 import traceback
                 traceback.print_exc()
             return {"error": f"Error in hybrid search: {str(e)}"}
+        
 
     def search(self, query: str, search_type: str = "hybrid", limit: int = 10,
               processor: Any = None, prefetch_limit: int = 50, fusion_type: str = "rrf",
@@ -756,100 +1095,179 @@ class LanceDBManager(VectorDBInterface):
                 import traceback
                 traceback.print_exc()
             return {"error": str(e)}
+        
 
     def search_dense(self, query: str, processor: Any, limit: int, score_threshold: float = None,
-                   rerank: bool = False, reranker_type: str = None):
-        """
-        Perform dense vector search with optional reranking
-        
-        Args:
-            query: Search query string
-            processor: Document processor with embedding capabilities
-            limit: Number of results to return
-            score_threshold: Minimum score threshold
-            rerank: Whether to apply reranking
-            reranker_type: Type of reranker to use (colbert, cohere, jina, cross)
-        """
+                    rerank: bool = False, reranker_type: str = None):
+        """Perform dense vector search with consistent handling and optimized parameters"""
         if processor is None:
             return {"error": "Dense search requires an embedding model"}
         
         try:
-            # Generate query vector
+            # Ensure we have a working table connection
+            if self.table is None:
+                try:
+                    self.connect()
+                    self.table = self.db.open_table(self.collection_name)
+                except Exception as e:
+                    return {"error": f"Could not connect to table: {e}"}
+                    
+            # Generate dense embedding
             query_vector = processor.get_embedding(query)
             
-            # Ensure vector index exists
-            if not self.has_vector_index:
-                self._ensure_indexes()
-            
-            # If reranking is enabled, fetch more results for reranker to choose from
-            overfetch_factor = 3 if rerank else 1
-            fetch_limit = limit * overfetch_factor
-            
-            # Perform vector search
-            if self.verbose:
-                print(f"Performing dense vector search for: '{query}'")
-                if rerank:
-                    print(f"Will oversample by factor {overfetch_factor} for reranking")
-            
-            # Check for any unindexed data to decide on fast_search
-            fast_search = True
+            # Calculate appropriate nprobes based on collection size
+            # Estimate table size if possible
             try:
-                # Get vector index name (usually "vector_idx")
-                indices = self.table.list_indices()
-                vector_index = next((idx for idx in indices if idx.get("type", "") in ["IVF_PQ", "HNSW", "IVF_FLAT"]), None)
+                # Try to count rows for probes calculation
+                count_result = self.table.sql("SELECT COUNT(*) as count FROM data").to_arrow()
+                if hasattr(count_result, 'to_pandas'):
+                    row_count = int(count_result.to_pandas()["count"].iloc[0])
+                else:
+                    row_count = int(count_result["count"][0])
+            except:
+                # Default assumption
+                row_count = 1000  # Conservative default
                 
-                if vector_index:
-                    idx_name = vector_index.get("name", "vector_idx")
-                    stats = self.table.index_stats(idx_name)
+            # Calculate appropriate nprobes (5-15% of partitions)
+            # First get index information to see how many partitions we have
+            index_info = None
+            try:
+                indices = self.table.list_indices()
+                for idx in indices:
+                    if hasattr(idx, 'type') and idx.type == 'IVF_PQ' and hasattr(idx, 'vector_column_name') and idx.vector_column_name == 'vector':
+                        index_info = idx
+                        break
+            except:
+                pass
+                
+            # Set nprobes based on partitions or data size
+            if index_info and hasattr(index_info, 'num_partitions'):
+                num_partitions = index_info.num_partitions
+                nprobes = max(2, min(256, int(num_partitions * 0.1)))  # 10% of partitions
+            else:
+                # Estimate based on data size (square root is often used for num_partitions)
+                estimated_partitions = max(2, min(256, int(row_count ** 0.5)))
+                nprobes = max(2, min(64, int(estimated_partitions * 0.1)))  # 10% of estimated partitions
+                
+            # Set refine_factor based on data size
+            # For smaller datasets, higher refine_factor is feasible
+            if row_count < 1000:
+                refine_factor = 10  # Higher refine for small datasets
+            elif row_count < 10000:
+                refine_factor = 5
+            else:
+                refine_factor = 3  # Lower refine for large datasets
+                
+            if self.verbose:
+                print(f"Vector search parameters: nprobes={nprobes}, refine_factor={refine_factor}")
+            
+            # Get initial search results with optimized parameters
+            search_result = None
+            try:
+                # Try with newer API first
+                search_result = (
+                    self.table.search(
+                        query_vector.tolist(),
+                        vector_column_name="vector",
+                        metric="cosine"
+                    )
+                    .nprobes(nprobes)          # Parameter for index efficiency
+                    .refine_factor(refine_factor)  # Parameter for result quality
+                    .limit(limit * 3)          # Get more results for filtering
+                )
+                
+                # Apply score threshold if provided
+                if score_threshold is not None:
+                    search_result = search_result.where(f"_distance >= {score_threshold}")
                     
-                    if stats.num_unindexed_rows > 0:
-                        if self.verbose:
-                            print(f"Warning: {stats.num_unindexed_rows} unindexed rows. Setting fast_search=False to include all data.")
-                        fast_search = False
+                # Get results
+                search_result = search_result.to_pandas()
             except Exception as e:
                 if self.verbose:
-                    print(f"Could not check for unindexed data: {e}")
+                    print(f"Error with optimized search: {e}")
+                    print("Trying alternative search method...")
+                    
+                # Try alternative methods if the first approach fails
+                try:
+                    search_result = self.table.search(
+                        query_vector.tolist(),
+                        vector_column_name="vector",
+                        metric="cosine",
+                        limit=limit * 3
+                    )
+                    
+                    # Convert to pandas
+                    if hasattr(search_result, 'to_pandas'):
+                        search_result = search_result.to_pandas()
+                    else:
+                        # Manual conversion if needed
+                        import pandas as pd
+                        arrow_result = search_result.to_arrow()
+                        search_result = pd.DataFrame({
+                            col: arrow_result[col].to_numpy() 
+                            for col in arrow_result.column_names
+                        })
+                except Exception as e2:
+                    if self.verbose:
+                        print(f"All vector search methods failed: {e}, {e2}")
+                    return {"error": f"Vector search failed: {e2}"}
             
-            # Get initial search results
-            search_results = self.table.search(
-                query_vector.tolist(), 
-                metric="cosine",
-                fast_search=fast_search
-            )
+            # Apply reranking if requested and we have results
+            if rerank and search_result is not None and len(search_result) > 0:
+                try:
+                    # Extract text data for reranking
+                    texts = search_result["text"].tolist()
+                    
+                    # Get reranker based on type
+                    reranker = self._get_reranker(reranker_type or "rrf", self.verbose)
+                    
+                    # Different reranking approaches based on availability
+                    if hasattr(processor, 'fastembed_provider') and processor.fastembed_provider is not None:
+                        if self.verbose:
+                            print(f"Reranking with FastEmbed")
+                        scores = processor.fastembed_provider.rerank_with_fastembed(query, texts)
+                    elif hasattr(processor, 'mlx_embedding_provider') and processor.mlx_embedding_provider is not None:
+                        if self.verbose:
+                            print(f"Reranking with MLX")
+                        scores = processor.mlx_embedding_provider.get_dense_embedding(query)
+                    elif hasattr(processor, 'ollama_embedding_provider') and processor.ollama_embedding_provider is not None:
+                        if self.verbose:
+                            print(f"Reranking with Ollama")
+                        scores = processor.ollama_embedding_provider.rerank_with_ollama(query, texts)
+                    else:
+                        # Simple cosine reranking
+                        if self.verbose:
+                            print(f"Reranking with simple cosine similarity")
+                        query_emb = processor.get_embedding(query)
+                        scores = []
+                        for text in texts:
+                            text_emb = processor.get_embedding(text)
+                            score = np.dot(query_emb, text_emb) / (np.linalg.norm(query_emb) * np.linalg.norm(text_emb))
+                            scores.append(float(score))
+                    
+                    # Add scores to dataframe
+                    search_result["rerank_score"] = scores
+                    
+                    # Sort by reranker scores
+                    search_result = search_result.sort_values("rerank_score", ascending=False)
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Reranking failed: {e}")
+                    # Continue with original results
             
-            # Apply score threshold if provided
-            if score_threshold is not None:
-                search_results = search_results.where(f"_distance >= {score_threshold}", prefilter=False)
+            # Limit to requested number
+            search_result = search_result.head(limit)
             
-            # Order by distance (similarity score) and get more results if we plan to rerank
-            search_results = search_results.order_by("_distance", ascending=False).limit(fetch_limit)
-            
-            # Apply reranking if requested
-            if rerank:
-                # Get reranker
-                reranker = self._get_reranker(reranker_type or "cross", self.verbose)
-                
-                if self.verbose:
-                    print(f"Applying {reranker_type or 'cross'} reranker to dense search results")
-                
-                # Apply reranking
-                search_results = search_results.rerank(reranker=reranker)
-            
-            # Get the final result set
-            results_df = search_results.limit(limit).to_pandas()
-            
-            # Record hit rate metrics if available
-            true_context = getattr(processor, 'expected_context', None)
-            if true_context:
-                hit = any(row["text"] == true_context for _, row in results_df.iterrows())
-                search_key = "vector"
-                if rerank:
-                    search_key += f"_{reranker_type or 'cross'}"
-                self._record_hit(search_key, hit)
-            
-            # Convert to the expected format
+            # Format as expected output
             results = []
-            for _, row in results_df.iterrows():
+            for _, row in search_result.iterrows():
+                # Create a result object (compatible with other backends)
+                class ResultItem:
+                    def __init__(self, id, payload, score):
+                        self.id = id
+                        self.payload = payload
+                        self.score = score
+                
                 # Parse metadata JSON
                 metadata = row.get("metadata", "{}")
                 if isinstance(metadata, str):
@@ -858,13 +1276,7 @@ class LanceDBManager(VectorDBInterface):
                     except:
                         metadata = {}
                 
-                # Create a result object (compatible with other backends)
-                class ResultItem:
-                    def __init__(self, id, payload, score):
-                        self.id = id
-                        self.payload = payload
-                        self.score = score
-                
+                # Create payload dictionary
                 payload = {
                     "text": row["text"],
                     "file_path": row["file_path"],
@@ -874,19 +1286,37 @@ class LanceDBManager(VectorDBInterface):
                     "metadata": metadata
                 }
                 
+                # Get score from appropriate column
+                if rerank and "rerank_score" in row:
+                    score = row["rerank_score"]
+                else:
+                    score = row.get("_distance", 0.0)
+                
+                # Create result object
                 result = ResultItem(
                     id=row["id"],
                     payload=payload,
-                    score=row.get("_distance", 0.0)
+                    score=score
                 )
                 
                 results.append(result)
             
-            return results
+            # Record metrics if ground truth is available
+            true_context = getattr(processor, 'expected_context', None)
+            if true_context:
+                hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in results)
+                search_key = "vector"
+                if rerank:
+                    search_key += f"_{reranker_type or 'default'}"
+                self._record_hit(search_key, hit)
             
+            return results
+                
         except Exception as e:
             if self.verbose:
-                print(f"Error in dense search: {e}")
+                print(f"Error in dense search: {str(e)}")
+                import traceback
+                traceback.print_exc()
             return {"error": f"Error in dense search: {str(e)}"}
 
     def search_sparse(self, query: str, processor: Any, limit: int, score_threshold: float = None,
@@ -1001,99 +1431,241 @@ class LanceDBManager(VectorDBInterface):
                 print(f"Error in sparse/keyword search: {e}")
             return {"error": f"Error in sparse search: {str(e)}"}
 
+
     def search_keyword(self, query: str, limit: int = 10, score_threshold: float = None,
-                     rerank: bool = False, reranker_type: str = None):
+                    rerank: bool = False, reranker_type: str = None):
         """
-        Perform keyword-based search using full-text search index
+        Perform a keyword-based search using full-text search index
+        
+        Updated to handle API changes in newer LanceDB versions
         
         Args:
             query: Search query string
             limit: Number of results to return
             score_threshold: Minimum score threshold
             rerank: Whether to apply reranking
-            reranker_type: Type of reranker to use (colbert, cohere, jina, cross)
+            reranker_type: Type of reranker to use
+            
+        Returns:
+            List of search results
         """
         try:
-            # Make sure FTS index exists
+            if not query.strip():
+                return {"error": "Empty query"}
+                
+            # Ensure we have a working table connection
+            if self.table is None:
+                try:
+                    self.connect()
+                    self.table = self.db.open_table(self.collection_name)
+                except Exception as e:
+                    return {"error": f"Could not connect to table: {e}"}
+                    
+            # Create FTS index if needed
             if not self.has_fts_index:
+                if self.verbose:
+                    print("Creating FTS index for text search...")
                 self._ensure_indexes()
-            
-            # If reranking is enabled, fetch more results for reranker to choose from
-            overfetch_factor = 3 if rerank else 1
-            fetch_limit = limit * overfetch_factor
-            
-            # Perform FTS search
+                    
             if self.verbose:
                 print(f"Performing keyword search for: '{query}'")
-                if rerank:
-                    print(f"Will oversample by factor {overfetch_factor} for reranking")
             
-            search_results = self.table.search(
-                query, 
-                query_type="fts"
-            )
-            
-            # Apply score threshold if provided
-            if score_threshold is not None:
-                search_results = search_results.where(f"_bm25 >= {score_threshold}", prefilter=False)
-            
-            # Order by BM25 score and limit results - get more if we're going to rerank
-            search_results = search_results.order_by("_bm25", ascending=False).limit(fetch_limit)
-            
-            # Apply reranking if requested
-            if rerank:
-                # Get reranker
-                reranker = self._get_reranker(reranker_type or "cross", self.verbose)
-                
-                if self.verbose:
-                    print(f"Applying {reranker_type or 'cross'} reranker to keyword search results")
-                
-                # Apply reranking
-                search_results = search_results.rerank(reranker=reranker)
-            
-            # Get the final result set
-            results_df = search_results.limit(limit).to_pandas()
-            
-            # Convert results to the expected format
-            results = []
-            for _, row in results_df.iterrows():
-                # Parse metadata JSON
-                metadata = row.get("metadata", "{}")
-                if isinstance(metadata, str):
-                    try:
-                        metadata = json.loads(metadata)
-                    except:
-                        metadata = {}
-                
-                # Create a result object (compatible with other backends)
-                class ResultItem:
-                    def __init__(self, id, payload, score):
-                        self.id = id
-                        self.payload = payload
-                        self.score = score
-                
-                payload = {
-                    "text": row["text"],
-                    "file_path": row["file_path"],
-                    "file_name": row["file_name"],
-                    "chunk_index": row["chunk_index"],
-                    "total_chunks": row.get("total_chunks", 0),
-                    "metadata": metadata
-                }
-                
-                result = ResultItem(
-                    id=row["id"],
-                    payload=payload,
-                    score=row.get("_bm25", 0.0)  # Use BM25 score for keyword-based search
+            try:
+                # Try newest API first - FTS search with limit
+                search_results = (
+                    self.table.search(
+                        query,
+                        query_type="fts"
+                    )
+                    .limit(limit * 3)  # Get more results for possible filtering
                 )
                 
-                results.append(result)
-            
-            return results
-            
+                # Apply score threshold if provided
+                # Note: Different LanceDB versions use different column names for scores
+                if score_threshold is not None:
+                    try:
+                        # Try with _bm25 score filter
+                        search_results = search_results.where(f"_bm25 >= {score_threshold}", prefilter=False)
+                    except:
+                        try:
+                            # Try with _score filter
+                            search_results = search_results.where(f"_score >= {score_threshold}", prefilter=False)
+                        except:
+                            if self.verbose:
+                                print(f"Could not apply score threshold - filter not supported")
+                
+                # Get the results as pandas DataFrame
+                try:
+                    # First try to_pandas()
+                    results_df = search_results.to_pandas()
+                except Exception as e1:
+                    try:
+                        # Try with to_arrow().to_pandas()
+                        results_arr = search_results.to_arrow()
+                        if hasattr(results_arr, 'to_pandas'):
+                            results_df = results_arr.to_pandas()
+                        else:
+                            # Manual conversion if needed
+                            import pandas as pd
+                            results_df = pd.DataFrame({
+                                col: results_arr[col].to_numpy() 
+                                for col in results_arr.column_names
+                            })
+                    except Exception as e2:
+                        return {"error": f"Error converting search results: {e1}; then {e2}"}
+                        
+                # Sort by score if available (different column names in different versions)
+                for score_col in ['_bm25', '_score', 'score']:
+                    if score_col in results_df.columns:
+                        results_df = results_df.sort_values(by=score_col, ascending=False)
+                        break
+                
+                # Limit to requested number after sorting
+                results_df = results_df.head(limit)
+                
+                # Format results in the expected format
+                results = []
+                for _, row in results_df.iterrows():
+                    # Create a result object (compatible with other backends)
+                    class ResultItem:
+                        def __init__(self, id, payload, score):
+                            self.id = id
+                            self.payload = payload
+                            self.score = score
+                    
+                    # Parse metadata JSON
+                    metadata = row.get("metadata", "{}")
+                    if isinstance(metadata, str):
+                        try:
+                            metadata = json.loads(metadata)
+                        except:
+                            metadata = {}
+                    
+                    # Create payload dictionary
+                    payload = {
+                        "text": row["text"],
+                        "file_path": row["file_path"],
+                        "file_name": row["file_name"],
+                        "chunk_index": row["chunk_index"],
+                        "total_chunks": row.get("total_chunks", 0),
+                        "metadata": metadata
+                    }
+                    
+                    # Extract score from appropriate column
+                    score = 0.0
+                    for score_col in ['_bm25', '_score', 'score']:
+                        if score_col in row:
+                            score = row[score_col]
+                            break
+                    
+                    # Create result object
+                    result = ResultItem(
+                        id=row["id"],
+                        payload=payload,
+                        score=score
+                    )
+                    
+                    results.append(result)
+                    
+                return results
+                    
+            except Exception as e:
+                if self.verbose:
+                    print(f"Error in keyword search: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    
+                # Try alternate approach using SQL
+                try:
+                    if self.verbose:
+                        print("Trying SQL-based keyword search...")
+                        
+                    # Escape single quotes in query
+                    sql_query = query.replace("'", "''")
+                    
+                    # Prepare SQL query
+                    sql = f"""
+                    SELECT *,
+                        SCORE() AS _score
+                    FROM data
+                    WHERE MATCH(text) AGAINST('{sql_query}')
+                    ORDER BY _score DESC
+                    LIMIT {limit * 3}
+                    """
+                    
+                    # Execute SQL query
+                    results = self.table.sql(sql)
+                    
+                    # Convert to pandas DataFrame
+                    try:
+                        results_df = results.to_pandas()
+                    except:
+                        # Try with to_arrow first
+                        results_arr = results.to_arrow()
+                        if hasattr(results_arr, 'to_pandas'):
+                            results_df = results_arr.to_pandas()
+                        else:
+                            # Manual conversion
+                            import pandas as pd
+                            results_df = pd.DataFrame({
+                                col: results_arr[col].to_numpy() 
+                                for col in results_arr.column_names
+                            })
+                    
+                    # Limit to requested number
+                    results_df = results_df.head(limit)
+                    
+                    # Format results in the expected format
+                    results = []
+                    for _, row in results_df.iterrows():
+                        # Create a result object (compatible with other backends)
+                        class ResultItem:
+                            def __init__(self, id, payload, score):
+                                self.id = id
+                                self.payload = payload
+                                self.score = score
+                        
+                        # Parse metadata JSON
+                        metadata = row.get("metadata", "{}")
+                        if isinstance(metadata, str):
+                            try:
+                                metadata = json.loads(metadata)
+                            except:
+                                metadata = {}
+                        
+                        # Create payload dictionary
+                        payload = {
+                            "text": row["text"],
+                            "file_path": row.get("file_path", ""),
+                            "file_name": row.get("file_name", ""),
+                            "chunk_index": row.get("chunk_index", 0),
+                            "total_chunks": row.get("total_chunks", 0),
+                            "metadata": metadata
+                        }
+                        
+                        # Extract score from appropriate column
+                        score = row.get("_score", 0.0)
+                        
+                        # Create result object
+                        result = ResultItem(
+                            id=row.get("id", f"result_{_}"),
+                            payload=payload,
+                            score=score
+                        )
+                        
+                        results.append(result)
+                        
+                    return results
+                except Exception as e2:
+                    if self.verbose:
+                        print(f"SQL-based search also failed: {e2}")
+                    return {"error": f"Error in keyword search: {str(e)}; SQL fallback: {str(e2)}"}
+        
         except Exception as e:
             if self.verbose:
-                print(f"Error in keyword search: {e}")
+                print(f"Error in keyword search: {str(e)}")
+                import traceback
+                traceback.print_exc()
             return {"error": f"Error in keyword search: {str(e)}"}
 
     def _retrieve_context_for_chunk(self, file_path: str, chunk_index: int, window: int = 1) -> str:

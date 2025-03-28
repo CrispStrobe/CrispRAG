@@ -121,17 +121,25 @@ class DBFactory:
         class_name = db_info["class"]
         dependencies = db_info["dependencies"]
         
+        # Check dependencies are installed before attempting imports
+        if db_type == "lancedb":
+            try:
+                import lancedb
+                import pyarrow
+            except ImportError as e:
+                missing_dep = "lancedb" if "lancedb" in str(e) else "pyarrow"
+                raise ValueError(f"LanceDB support not available. Install with: pip install {missing_dep}")
+        
         try:
             # Import specific database module based on type
             if db_type == "qdrant":
                 from qdrant_db import QdrantManager
                 return QdrantManager(**kwargs)
             elif db_type == "lancedb":
-                try:
-                    from lancedb_manager import LanceDBManager
-                    return LanceDBManager(**kwargs)
-                except ImportError:
-                    raise ValueError("LanceDB support not available. Install with: pip install lancedb pyarrow")
+                # Use an absolute import to ensure we find the module
+                import lancedb_manager
+                from lancedb_manager import LanceDBManager
+                return LanceDBManager(**kwargs)
             elif db_type == "meilisearch":
                 try:
                     from meilisearch_manager import MeilisearchManager
