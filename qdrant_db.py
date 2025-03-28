@@ -181,125 +181,183 @@ class QdrantManager(VectorDBInterface):
             print("You may need to install Qdrant client: pip install qdrant-client")
             raise
         
+    def _get_embedder_name(self, model_id=None):
+        """
+        Get standardized embedder name for the given model ID, adapted for Meilisearch requirements.
+        """
+        model_id = model_id or self.dense_model_id
+        
+        # Extract just the final part of the model name if it has slashes
+        # This gives us a more concise name without losing the essential identifier
+        if "/" in model_id:
+            # For models like "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+            # Just use the part after the last slash
+            model_base = model_id.split("/")[-1]
+        else:
+            model_base = model_id
+            
+        # Sanitize the base name
+        model_base = re.sub(r'[^a-zA-Z0-9]', '_', model_base)
+        
+        # Ensure name doesn't exceed reasonable length
+        max_name_length = 40
+        if len(model_base) > max_name_length:
+            model_base = model_base[:max_name_length]
+        
+        embedder_name = f"dense_{model_base}"
+        
+        if self.verbose:
+            print(f"Created embedder name from model: {model_id} → {embedder_name}")
+        
+        return embedder_name
+
     def create_collection(self, recreate: bool = False) -> None:
-        """Create Qdrant collection with support for both dense and sparse vectors"""
+        """Create Meilisearch index with vector search capabilities"""
         try:
-            # Import Qdrant models
-            from qdrant_client.models import VectorParams, Distance, SparseVectorParams, SparseIndexParams
-            
-            collections = self.client.get_collections().collections
-            collection_exists = any(c.name == self.collection_name for c in collections)
-
-            # Create vector name based on model ID
-            dense_vector_name, sparse_vector_name = self._get_vector_names()
-            
-            if self.verbose:
-                print(f"Using vector names: {dense_vector_name} (dense) and {sparse_vector_name} (sparse)")
-
-            if collection_exists:
-                if recreate:
-                    if self.verbose:
-                        print(f"Recreating collection '{self.collection_name}'...")
-                    self.client.delete_collection(self.collection_name)
-                else:
-                    if self.verbose:
-                        print(f"Collection '{self.collection_name}' already exists.")
-                    return
-
-            if self.verbose:
-                print(f"Creating collection '{self.collection_name}' with vector size {self.vector_dim}")
-
-            # Create collection with dense vectors
-            vectors_config = {
-                dense_vector_name: VectorParams(
-                    size=self.vector_dim,
-                    distance=Distance.COSINE
-                )
-            }
-            
-            # Create sparse vectors config
-            sparse_vectors_config = {
-                sparse_vector_name: SparseVectorParams(
-                    index=SparseIndexParams(on_disk=False)
-                )
-            }
-            
-            # Create collection with both dense and sparse vectors
+            # Check if the index already exists (using more robust approach)
+            exists = False
             try:
-                self.client.create_collection(
-                    collection_name=self.collection_name,
-                    vectors_config=vectors_config,
-                    sparse_vectors_config=sparse_vectors_config
-                )
-                
-                if self.verbose:
-                    print(f"Successfully created collection with dense and sparse vectors")
-            except Exception as e:
-                # Fallback for compatibility with older clients
-                if self.verbose:
-                    print(f"Error with integrated creation: {e}")
-                    print("Falling back to two-step creation")
-                    
-                # Create with just dense vectors first
-                self.client.create_collection(
-                    collection_name=self.collection_name,
-                    vectors_config=vectors_config
-                )
-                
-                # Then add sparse vectors separately
+                # Directly try to get the index
                 try:
-                    self.client.create_sparse_vector(
-                        collection_name=self.collection_name,
-                        vector_name=sparse_vector_name,
-                        on_disk=False
-                    )
+                    self.client.get_index(self.collection_name)
+                    exists = True
                     if self.verbose:
-                        print(f"Added sparse vector configuration: {sparse_vector_name}")
-                except Exception as e2:
-                    # Handle older clients that might not have create_sparse_vector
-                    if "AttributeError" in str(e2):
-                        try:
-                            # Try alternative approach for older clients
-                            self.client.update_collection(
-                                collection_name=self.collection_name,
-                                sparse_vectors_config=sparse_vectors_config
-                            )
-                            if self.verbose:
-                                print(f"Added sparse vector configuration using update_collection")
-                        except Exception as e3:
-                            print(f"Warning: Could not add sparse vectors: {e3}")
-                            print("Sparse search may not work properly.")
+                        print(f"Index '{self.collection_name}' exists")
+                except Exception as e:
+                    if "index not found" in str(e).lower() or "not found" in str(e).lower():
+                        exists = False
+                        if self.verbose:
+                            print(f"Index '{self.collection_name}' does not exist")
                     else:
-                        print(f"Warning: Could not add sparse vectors: {e2}")
-                        print("Sparse search may not work properly.")
-
-            # Create payload indexes for better filtering performance
-            try:
-                # Create text index for full-text search
-                self.client.create_payload_index(
-                    collection_name=self.collection_name,
-                    field_name="text",
-                    field_schema="text"  # Simplified schema that works across versions
-                )
-                
-                # Create keyword indexes for exact matching
-                for field in ["file_name", "file_path"]:
-                    self.client.create_payload_index(
-                        collection_name=self.collection_name,
-                        field_name=field,
-                        field_schema="keyword"
-                    )
-                    
-                if self.verbose:
-                    print(f"✅ Collection '{self.collection_name}' created successfully with indexes")
-                    
+                        # Try with get_indexes as fallback
+                        indexes_response = self.client.get_indexes()
+                        
+                        if isinstance(indexes_response, dict) and 'results' in indexes_response:
+                            exists = any(index.get('uid') == self.collection_name for index in indexes_response['results'])
+                        else:
+                            # Try as object
+                            results = getattr(indexes_response, 'results', None)
+                            if results:
+                                exists = any(getattr(index, 'uid', None) == self.collection_name for index in results)
             except Exception as e:
                 if self.verbose:
-                    print(f"⚠️ Could not create payload indexes: {e}")
-                    print(f"✅ Collection '{self.collection_name}' created successfully (without indexes)")
-
+                    print(f"Error checking for index existence: {e}")
+                    
+            # If index exists and recreate is True, delete it
+            if exists and recreate:
+                if self.verbose:
+                    print(f"Deleting existing index '{self.collection_name}'")
+                try:
+                    task = self.client.delete_index(self.collection_name)
+                    # Wait for the task to complete if possible
+                    self._wait_for_task(task)
+                    exists = False
+                except Exception as e:
+                    print(f"Error deleting index: {e}")
+                    
+            # Create index if it doesn't exist
+            if not exists:
+                if self.verbose:
+                    print(f"Creating index '{self.collection_name}' with primary key 'id'")
+                task = self.client.create_index(self.collection_name, {'primaryKey': 'id'})
+                # Wait for the task to complete
+                self._wait_for_task(task)
+                
+            # Get the index
+            self.index = self.client.index(self.collection_name)
+            
+            # Configure index settings to match the working implementation in search_04.py
+            settings = {
+                'searchableAttributes': [
+                    'title', 
+                    'content', 
+                    'path', 
+                    'filename',
+                    'sparse_terms',  # For sparse vector simulation
+                    'text'           # Add 'text' attribute to searchable attributes
+                ],
+                'filterableAttributes': [
+                    'fileType', 
+                    'extension', 
+                    'path', 
+                    'directory', 
+                    'lastIndexed',
+                    'is_chunk', 
+                    'is_parent', 
+                    'parent_id', 
+                    'chunk_index'
+                ],
+                'sortableAttributes': [
+                    'createdAt', 
+                    'fileSize', 
+                    'lastIndexed', 
+                    'modifiedAt', 
+                    'chunk_index'
+                ],
+                'rankingRules': [
+                    'words',
+                    'typo',
+                    'proximity',
+                    'attribute',
+                    'sort',
+                    'exactness'
+                ]
+            }
+            
+            # Update settings
+            task = self.index.update_settings(settings)
+            self._wait_for_task(task)
+            
+            # Configure vector settings for Meilisearch if we have the vector dimension
+            if self.vector_dim > 0:
+                # Use a consistent embedder naming approach
+                embedder_name = self._get_embedder_name(self.dense_model_id)
+                
+                # Configure the embedder with userProvided source and dimensions
+                # This is required by Meilisearch regardless of naming
+                embedder_settings = {
+                    embedder_name: {
+                        'source': 'userProvided',
+                        'dimensions': self.vector_dim
+                    }
+                }
+                
+                try:
+                    if self.verbose:
+                        print(f"Configuring embedder with settings: {embedder_settings}")
+                        
+                    # Try the dedicated method first (newer Meilisearch versions)
+                    try:
+                        task = self.index.update_embedders(embedder_settings)
+                        self._wait_for_task(task)
+                        if self.verbose:
+                            print(f"Vector search enabled with {self.vector_dim} dimensions using embedder: {embedder_name}")
+                    except AttributeError:
+                        # Fall back to direct API call for older clients
+                        import requests
+                        response = requests.patch(
+                            f"{self.url}/indexes/{self.collection_name}/settings/embedders",
+                            headers={
+                                "Content-Type": "application/json",
+                                "Authorization": f"Bearer {self.api_key}" if self.api_key else None
+                            },
+                            json=embedder_settings
+                        )
+                        
+                        if response.status_code == 202:
+                            if self.verbose:
+                                print(f"Vector search enabled via REST API with embedder: {embedder_name}")
+                        else:
+                            print(f"Failed to enable vector search via REST API: {response.text}")
+                except Exception as e:
+                    print(f"Error configuring vector search: {e}")
+                    print("Documents will be indexed without vector search capabilities")
+                    
+            if self.verbose:
+                print(f"Index '{self.collection_name}' configured successfully")
+                
         except Exception as e:
-            print(f"❌ Error creating collection '{self.collection_name}': {e}")
+            print(f"Error creating collection: {str(e)}")
             raise
 
     # Implementation for retrieving context for a chunk
@@ -468,65 +526,69 @@ class QdrantManager(VectorDBInterface):
         return result
     
     def insert_embeddings(self, embeddings_with_payloads: List[Tuple[np.ndarray, Dict[str, Any]]]) -> None:
-        """Insert embeddings into Qdrant (dense only, with generated sparse)"""
+        """
+        Insert documents with dense vector embeddings into Meilisearch.
+        
+        Args:
+            embeddings_with_payloads: List of (embedding, payload) tuples
+        """
         if not embeddings_with_payloads:
             return
-            
+        
         try:
-            # Determine vector name based on model ID (fallback to default if not in payload)
+            if not self.index:
+                raise ValueError(f"Index '{self.collection_name}' not initialized")
+            
+            # Get embedder name from the first payload
             first_payload = embeddings_with_payloads[0][1]
             dense_model_id = first_payload.get("metadata", {}).get("embedder", self.dense_model_id)
-            dense_vector_name, sparse_vector_name = self._get_vector_names(dense_model_id, self.sparse_model_id)
+            embedder_name = self._get_embedder_name(dense_model_id)
             
             if self.verbose:
-                print(f"Using vector names: {dense_vector_name} (dense) and {sparse_vector_name} (sparse)")
+                print(f"Using embedder name: {embedder_name}")
             
-            # Prepare points for insertion
-            points = []
-            for i, (embedding, payload) in enumerate(embeddings_with_payloads):
-                # Generate a UUID for the point
-                import uuid
-                point_id = str(uuid.uuid4())
+            # Prepare documents for insertion with proper _vectors field
+            documents = []
+            for embedding, payload in embeddings_with_payloads:
+                # Generate ID if not provided
+                if 'id' not in payload:
+                    doc_id = str(uuid.uuid4())
+                else:
+                    doc_id = payload['id']
                 
-                # Generate sparse vector for the text
-                text = payload.get("text", "")
-                sparse_indices, sparse_values = generate_sparse_vector(text)
-                
-                # Create point with vectors in the correct format
-                vector_dict = {
-                    dense_vector_name: embedding.tolist(),
-                    sparse_vector_name: {
-                        "indices": sparse_indices,
-                        "values": sparse_values
-                    }
+                # Create document with all payload fields
+                document = {
+                    'id': doc_id,
+                    **payload  # Include all payload fields
                 }
                 
-                point = PointStruct(
-                    id=point_id,
-                    vector=vector_dict,  # Include both dense and sparse in vector dictionary
-                    payload=payload
-                )
-                points.append(point)
+                # Add vector embedding in the _vectors field with named embedder format
+                document['_vectors'] = {
+                    embedder_name: embedding.tolist()  # Use the model-based embedder name
+                }
+                
+                documents.append(document)
             
             if self.verbose:
-                print(f"Inserting {len(points)} points into collection '{self.collection_name}'")
+                print(f"Inserting {len(documents)} documents with vector embeddings")
+            
+            # Insert documents in batches
+            batch_size = 100
+            for i in range(0, len(documents), batch_size):
+                batch = documents[i:i+batch_size]
                 
-            # Insert points in batches
-            BATCH_SIZE = 100
-            for i in range(0, len(points), BATCH_SIZE):
-                batch = points[i:i+BATCH_SIZE]
-                if self.verbose and len(points) > BATCH_SIZE:
-                    print(f"Inserting batch {i//BATCH_SIZE + 1}/{(len(points)-1)//BATCH_SIZE + 1} ({len(batch)} points)")
+                if self.verbose and len(documents) > batch_size:
+                    print(f"Inserting batch {i//batch_size + 1}/{(len(documents)-1)//batch_size + 1}")
                 
-                self.client.upsert(
-                    collection_name=self.collection_name,
-                    points=batch
-                )
+                # Add documents
+                task = self.index.add_documents(batch)
+                self._wait_for_task(task)
                 
             if self.verbose:
-                print(f"Successfully inserted {len(points)} points")
+                print(f"Successfully inserted {len(documents)} documents with vector embeddings")
+                
         except Exception as e:
-            print(f"Error inserting embeddings: {str(e)}")
+            print(f"Error inserting documents with vectors: {str(e)}")
             raise
 
     def insert_embeddings_with_sparse(self, embeddings_with_sparse: List[Tuple[np.ndarray, Dict[str, Any], Tuple[List[int], List[float]]]]) -> None:
@@ -617,138 +679,105 @@ class QdrantManager(VectorDBInterface):
         """
         # We don't implement actual rerankers here, just return the type for later processing
         return reranker_type.lower()
-
+        
     def search_hybrid(self, query: str, processor: Any, limit: int, 
                     prefetch_limit: int = 50, fusion_type: str = "rrf",
                     score_threshold: float = None, rerank: bool = False,
                     reranker_type: str = None):
         """
-        Perform a hybrid search combining both dense and sparse vectors with optional reranking
-        
-        Args:
-            query: Original search query
-            processor: Document processor with embedding capabilities
-            limit: Maximum number of results to return
-            prefetch_limit: Number of results to prefetch for fusion
-            fusion_type: Type of fusion to use (rrf or dbsf)
-            score_threshold: Minimum score threshold
-            rerank: Whether to apply reranking as a third step
-            reranker_type: Type of reranker to use (not directly used in Qdrant, but tracked for metrics)
+        Perform hybrid search combining dense vectors and keywords.
         """
         if processor is None:
             return {"error": "Hybrid search requires an embedding model"}
         
         try:
-            # Generate query vector
+            # Generate query embedding
             query_vector = processor.get_embedding(query)
             
-            # Generate sparse vector for the query
-            sparse_indices, sparse_values = processor.get_sparse_embedding(query)
+            # Get embedder name using the consistent naming approach
+            dense_model_id = getattr(processor, 'dense_model_id', self.dense_model_id)
+            embedder_name = self._get_embedder_name(dense_model_id)
             
-            # Get vector names
-            dense_vector_name, sparse_vector_name = self._get_vector_names()
-            
-            # Calculate oversampling factor
-            oversample_factor = 3 if rerank else 1
-            fetch_limit = min(prefetch_limit, limit * oversample_factor)
+            # Determine semantic ratio based on fusion type
+            semantic_ratio = 0.5  # Default balanced ratio
+            if fusion_type.lower() == 'vector':
+                semantic_ratio = 0.9  # Mostly vector search
+            elif fusion_type.lower() == 'keyword':
+                semantic_ratio = 0.1  # Mostly keyword search
             
             if self.verbose:
-                print(f"Performing hybrid search for: '{query}'")
-                if rerank:
-                    print(f"Will oversample by factor {oversample_factor} for reranking")
+                print(f"Executing hybrid search with semanticRatio={semantic_ratio}")
+                print(f"Using embedder name: {embedder_name}")
             
-            # Perform hybrid search using native fusion if available
-            try:
-                from qdrant_client.models import Prefetch, FusionQuery, Fusion, SparseVector
-                
-                # Create prefetch list
-                prefetch_list = [
-                    # Dense vector prefetch
-                    Prefetch(
-                        query=query_vector.tolist(),
-                        using=dense_vector_name,
-                        limit=fetch_limit,
-                    ),
-                    # Sparse vector prefetch 
-                    Prefetch(
-                        query=SparseVector(
-                            indices=sparse_indices,
-                            values=sparse_values
-                        ),
-                        using=sparse_vector_name,
-                        limit=fetch_limit,
-                    )
-                ]
-                
-                # Choose fusion method
-                fusion_enum = Fusion.DBSF if fusion_type.lower() == "dbsf" else Fusion.RRF
-                
-                # Hybrid query
-                response = self.client.query_points(
-                    collection_name=self.collection_name,
-                    prefetch=prefetch_list,
-                    query=FusionQuery(fusion=fusion_enum),
-                    limit=fetch_limit,
-                    with_payload=True
-                )
-                
-                points = response.points
-                
-                if self.verbose:
-                    print(f"Hybrid search with fusion returned {len(points)} results")
-                    
-            except Exception as e:
-                if self.verbose:
-                    print(f"Modern fusion-based hybrid search failed: {e}")
-                    print("Using manual hybrid search approach")
-                
-                # Perform separate searches and combine manually
-                dense_results = self.search_dense(query, processor, fetch_limit, score_threshold)
-                if isinstance(dense_results, dict) and "error" in dense_results:
-                    dense_results = []
-                
-                sparse_results = self.search_sparse(query, processor, fetch_limit, score_threshold)
-                if isinstance(sparse_results, dict) and "error" in sparse_results:
-                    sparse_results = []
-                    
-                # Combine and rerank results using appropriate fusion strategy
-                points = SearchAlgorithms.manual_fusion(
-                    dense_results, 
-                    sparse_results, 
-                    fetch_limit, 
-                    fusion_type
-                )
+            # Build search parameters using the model-based embedder name
+            search_params = {
+                'limit': limit * 2,
+                'attributesToRetrieve': ['*'],
+                'vector': query_vector.tolist(),
+                'hybrid': {
+                    'embedder': embedder_name,   # Use consistent model-based embedder name
+                    'semanticRatio': semantic_ratio
+                }
+            }
             
-            # Apply reranking if requested
-            if rerank and len(points) > 0:
-                if self.verbose:
-                    print(f"Applying {reranker_type or 'default'} reranking to {len(points)} results")
-                
-                points = SearchAlgorithms.rerank_results(query, points, processor, limit, self.verbose)
-                
-                # Record metrics if ground truth is available
-                true_context = getattr(processor, 'expected_context', None)
-                if true_context:
-                    hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in points)
-                    search_key = f"hybrid_{fusion_type}"
-                    if rerank:
-                        search_key += f"_{reranker_type or 'default'}"
-                    self._record_hit(search_key, hit)
-                
-            # Apply score threshold if not already applied
             if score_threshold is not None:
-                points = [p for p in points if ResultProcessor.get_score(p) >= score_threshold]
-                
-            # Limit to requested number
-            points = points[:limit]
+                search_params['scoreThreshold'] = score_threshold
             
-            return points
-        
+            # Execute hybrid search with both query text and vector
+            results = self.index.search(query, search_params)
+            
+            # Extract hits
+            hits = []
+            if hasattr(results, 'hits'):
+                hits = results.hits
+            elif isinstance(results, dict) and 'hits' in results:
+                hits = results['hits']
+            
+            if self.verbose:
+                print(f"Hybrid search returned {len(hits)} results")
+            
+            # Format results
+            formatted_results = []
+            for hit in hits[:limit]:
+                result = {}
+                
+                # Copy all fields
+                if isinstance(hit, dict):
+                    for k, v in hit.items():
+                        result[k] = v
+                else:
+                    for attr in dir(hit):
+                        if not attr.startswith('_') and not callable(getattr(hit, attr)):
+                            result[attr] = getattr(hit, attr)
+                
+                # Get semantic score if available
+                if isinstance(hit, dict) and '_semanticScore' in hit:
+                    result['score'] = hit['_semanticScore']
+                elif hasattr(hit, '_semanticScore'):
+                    result['score'] = hit._semanticScore
+                else:
+                    result['score'] = 0.8  # Default score
+                
+                # Ensure content field exists
+                if 'text' in result and 'content' not in result:
+                    result['content'] = result['text']
+                
+                # Add payload field for compatibility
+                result['payload'] = {}
+                for k, v in result.items():
+                    if k != 'payload':
+                        result['payload'][k] = v
+                
+                formatted_results.append(result)
+            
+            return formatted_results
+            
         except Exception as e:
-            print(f"Error in hybrid search: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return SearchAlgorithms.handle_search_error("qdrant", "hybrid", e, self.verbose)
+            if self.verbose:
+                print(f"Error in hybrid search: {e}")
+                print("Falling back to keyword search")
+            return self.search_keyword(query, limit)
+
 
     def search(self, query: str, search_type: str = "hybrid", limit: int = 10,
             processor: Any = None, prefetch_limit: int = 50, fusion_type: str = "rrf",
@@ -842,132 +871,94 @@ class QdrantManager(VectorDBInterface):
             traceback.print_exc()
             return {"error": str(e)}
 
-    def search_dense(self, query: str, processor: Any, limit: int, score_threshold: float = None):
-        """Perform dense vector search with consistent handling"""
+    def search_dense(self, query: str, processor: Any, limit: int, score_threshold: float = None,
+                    rerank: bool = False, reranker_type: str = None):
+        """
+        Perform vector search according to Meilisearch API requirements.
+        """
         if processor is None:
-            return {"error": "Dense search requires an embedding model"}
+            return {"error": "Vector search requires an embedding model"}
         
         try:
-            # Get dense vector name with consistent sanitization
-            dense_model_id = getattr(processor, 'dense_model_id', self.dense_model_id)
-            dense_vector_name, _ = self._get_vector_names(dense_model_id, None)
-            
-            if self.verbose:
-                print(f"Using vector name for dense search: {dense_vector_name}")
-            
-            # Generate dense embedding
+            # Generate query embedding
             query_vector = processor.get_embedding(query)
             
-            # Attempt to use different search methods in order of preference
-            try:
-                # Modern approach with specific vector name
-                search_result = self.client.search(
-                    collection_name=self.collection_name,
-                    query_vector=(dense_vector_name, query_vector.tolist()),
-                    limit=limit * 3,  # Get more results than needed for filtering
-                    with_payload=True,
-                    score_threshold=score_threshold
-                )
+            # Get embedder name using the consistent naming approach
+            dense_model_id = getattr(processor, 'dense_model_id', self.dense_model_id)
+            embedder_name = self._get_embedder_name(dense_model_id)
+            
+            if self.verbose:
+                print(f"Executing vector search with {len(query_vector)}-dimensional query vector")
+                print(f"Using embedder name: {embedder_name}")
+            
+            # Use the model-based embedder name consistently
+            search_params = {
+                'limit': limit * 2,
+                'attributesToRetrieve': ['*'],
+                'vector': query_vector.tolist(),
+                'hybrid': {
+                    'embedder': embedder_name,  # Use consistent model-based embedder name
+                    'semanticRatio': 1.0        # Pure semantic search (100% vector)
+                }
+            }
+            
+            if score_threshold is not None:
+                search_params['scoreThreshold'] = score_threshold
+            
+            # Run search with empty query for pure vector search
+            results = self.index.search('', search_params)
+            
+            # Extract hits
+            hits = []
+            if hasattr(results, 'hits'):
+                hits = results.hits
+            elif isinstance(results, dict) and 'hits' in results:
+                hits = results['hits']
+            
+            if self.verbose:
+                print(f"Vector search returned {len(hits)} results")
                 
-                # Filter out problematic tiny chunks (less than 20 characters)
-                filtered_results = []
-                for point in search_result:
-                    if hasattr(point, "payload") and point.payload and "text" in point.payload:
-                        text = point.payload.get("text", "")
-                        # Only include chunks with meaningful content
-                        if len(text) >= 20:
-                            filtered_results.append(point)
+            # Format results
+            formatted_results = []
+            for hit in hits[:limit]:
+                result = {}
                 
-                if self.verbose:
-                    print(f"Dense search returned {len(search_result)} raw results")
-                    print(f"After filtering tiny chunks: {len(filtered_results)} results")
+                # Copy all fields
+                if isinstance(hit, dict):
+                    for k, v in hit.items():
+                        result[k] = v
+                else:
+                    for attr in dir(hit):
+                        if not attr.startswith('_') and not callable(getattr(hit, attr)):
+                            result[attr] = getattr(hit, attr)
                 
-                # Record metrics if ground truth is available
-                true_context = getattr(processor, 'expected_context', None)
-                if true_context:
-                    hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in filtered_results)
-                    self._record_hit("vector", hit)
+                # Get semantic score if available
+                if isinstance(hit, dict) and '_semanticScore' in hit:
+                    result['score'] = hit['_semanticScore']
+                elif hasattr(hit, '_semanticScore'):
+                    result['score'] = hit._semanticScore
+                else:
+                    result['score'] = 0.8  # Default score
                 
-                # Limit to requested number
-                return filtered_results[:limit]
+                # Ensure content field exists
+                if 'text' in result and 'content' not in result:
+                    result['content'] = result['text']
                 
-            except Exception as e:
-                if self.verbose:
-                    print(f"Standard dense search failed: {e}")
-                    print("Trying alternative dense search methods...")
+                # Add payload field for compatibility
+                result['payload'] = {}
+                for k, v in result.items():
+                    if k != 'payload':
+                        result['payload'][k] = v
                 
-                # Try with query_points API
-                try:
-                    result = self.client.query_points(
-                        collection_name=self.collection_name,
-                        query=query_vector.tolist(),
-                        using=dense_vector_name,
-                        limit=limit * 3,  # Get more results than needed for filtering
-                        with_payload=True,
-                        score_threshold=score_threshold
-                    )
-                    
-                    # Filter out problematic tiny chunks
-                    filtered_results = []
-                    for point in result.points:
-                        if hasattr(point, "payload") and point.payload and "text" in point.payload:
-                            text = point.payload.get("text", "")
-                            # Only include chunks with meaningful content
-                            if len(text) >= 20:
-                                filtered_results.append(point)
-                    
-                    if self.verbose:
-                        print(f"Dense search with query_points returned {len(result.points)} raw results")
-                        print(f"After filtering tiny chunks: {len(filtered_results)} results")
-                    
-                    # Record metrics if ground truth is available
-                    true_context = getattr(processor, 'expected_context', None)
-                    if true_context:
-                        hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in filtered_results)
-                        self._record_hit("vector", hit)
-                    
-                    # Limit to requested number
-                    return filtered_results[:limit]
-                    
-                except Exception as e2:
-                    # Last resort - try without named vectors
-                    try:
-                        search_result = self.client.search(
-                            collection_name=self.collection_name,
-                            query_vector=query_vector.tolist(),
-                            limit=limit * 3,  # Get more results than needed for filtering
-                            with_payload=True,
-                            score_threshold=score_threshold
-                        )
-                        
-                        # Filter out problematic tiny chunks
-                        filtered_results = []
-                        for point in search_result:
-                            if hasattr(point, "payload") and point.payload and "text" in point.payload:
-                                text = point.payload.get("text", "")
-                                # Only include chunks with meaningful content
-                                if len(text) >= 20:
-                                    filtered_results.append(point)
-                        
-                        if self.verbose:
-                            print(f"Dense search with legacy method returned {len(search_result)} raw results")
-                            print(f"After filtering tiny chunks: {len(filtered_results)} results")
-                        
-                        # Record metrics if ground truth is available
-                        true_context = getattr(processor, 'expected_context', None)
-                        if true_context:
-                            hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in filtered_results)
-                            self._record_hit("vector", hit)
-                        
-                        # Limit to requested number
-                        return filtered_results[:limit]
-                        
-                    except Exception as e3:
-                        return {"error": f"All dense search methods failed: {e3}"}
-        
+                formatted_results.append(result)
+            
+            return formatted_results
+            
         except Exception as e:
-            print(f"Error in dense search: {str(e)}")
-            return {"error": f"Error in dense search: {str(e)}"}
+            if self.verbose:
+                print(f"Error in vector search: {e}")
+                print("Falling back to keyword search")
+            return self.search_keyword(query, limit)
 
     def search_sparse(self, query: str, processor: Any, limit: int, score_threshold: float = None):
         """
