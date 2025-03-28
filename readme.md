@@ -1,18 +1,17 @@
 # CrispRAG
 
-A flexible and efficient vector search system supporting multiple database backends and embedding providers.
+A vector search system supporting multiple database backends and embedding providers. (Mostly for testing purposes.)
 
 ## Overview
 
-This project implements a modular system for semantic search using vector embeddings. It supports:
-
-- Multiple database backends: Qdrant, LanceDB, Meilisearch, Elasticsearch, and Milvus
-- Multiple embedding providers: MLX, Ollama, and FastEmbed
-- Dense and sparse vector representations
+Implements a modular system for semantic search using vector embeddings. It supports:
+- Multiple database backends: Qdrant, LanceDB, Meilisearch (others in progress)
+- Multiple embedding providers: MLX, Ollama
+- Dense and (if supported by db) sparse vector representations
 - Hybrid search with multiple fusion algorithms
 - Vector reranking options
 
-## Key Features
+## Features
 
 - **Unified Interface**: Common interface for all vector databases
 - **Modular Design**: Easily switch between different databases and embedding providers
@@ -79,8 +78,8 @@ python mlxrag.py index ./path/to/documents \
 ```
 
 Options:
-- `--db-type`: Choose from "qdrant", "lancedb", "meilisearch", "elasticsearch", "milvus"
-- `--use-mlx-models`, `--use-ollama`, or `--use-fastembed`: Choose embedding provider
+- `--db-type`: Choose from "qdrant", "lancedb", "meilisearch" (WIP: "elasticsearch", "milvus")
+- `--use-mlx-models`, `--use-ollama` (WIP: `--use-fastembed`): Choose embedding provider
 - `--dense-model`: Dense embedding model to use
 - `--sparse-model`: Sparse embedding model to use
 - `--include`: File patterns to include (e.g., "*.pdf *.txt")
@@ -124,25 +123,22 @@ The project follows a modular architecture:
 
 - `vector_db_interface.py`: Abstract interface and factory for vector databases
 - `utils.py`: Common utilities for text processing, search algorithms, and embedding
-- `mlx_utils.py`, `ollama_utils.py`, `fastembed_utils.py`: Embedding providers
+- `mlx_utils.py`, `ollama_utils.py`, etc: Embedding providers
 - Database implementations:
   - `qdrant_db.py`: Qdrant implementation
   - `lancedb_manager.py`: LanceDB implementation
   - `meilisearch_manager.py`: Meilisearch implementation
-  - `elasticsearch_manager.py`: Elasticsearch implementation
-  - `milvus_manager.py`: Milvus implementation
+  - etc
 - `mlxrag.py`: Command-line interface
 
 ## Extending the System
 
 ### Adding a New Database Backend
-
 1. Create a new class that implements the `VectorDBInterface` abstract methods
 2. Add the new database to the `DBFactory` in `vector_db_interface.py`
 3. Update the `AVAILABLE_DBS` dictionary in `__init__.py`
 
 ### Adding a New Embedding Provider
-
 1. Create a new utility file (e.g., `new_provider_utils.py`)
 2. Implement the embedding provider with methods compatible with the existing ones
 3. Update the `TextProcessor` class to support the new provider
