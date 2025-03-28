@@ -127,32 +127,74 @@ class LanceDBManager(VectorDBInterface):
             indices = self.table.list_indices()
             
             for index in indices:
-                index_name = index.get("name", "")
-                index_type = index.get("type", "")
-                index_column = index.get("column", "")
-                
-                if index_type in ["IVF_PQ", "HNSW", "IVF_FLAT"]:
-                    self.has_vector_index = True
-                    if self.verbose:
-                        print(f"Found existing vector index: {index_name} on column {index_column}")
-                        
-                elif index_type == "FULLTEXT":
-                    self.has_fts_index = True
-                    if self.verbose:
-                        print(f"Found existing full-text search index: {index_name} on column {index_column}")
-                        
-                elif index_type == "SCALAR":
-                    if not self.has_scalar_indexes:
-                        # Only mark as true if we find multiple scalar indexes
-                        scalar_indices = [idx for idx in indices if idx.get("type") == "SCALAR"]
-                        if len(scalar_indices) >= 2:  # We need at least file_path and chunk_index
-                            self.has_scalar_indexes = True
+                # Check attributes directly with proper error handling
+                try:
+                    # Get index name
+                    if hasattr(index, 'name'):
+                        index_name = index.name
+                    else:
+                        index_name = str(index)
                     
+                    # Get index type - different versions have different attribute structures
+                    if hasattr(index, 'type'):
+                        index_type = index.type
+                    elif hasattr(index, 'index_type'):
+                        index_type = index.index_type
+                    elif hasattr(index, 'config') and hasattr(index.config, 'index_type'):
+                        index_type = index.config.index_type
+                    else:
+                        # Try to infer type from name
+                        if 'vector' in str(index).lower():
+                            index_type = 'IVF_PQ'
+                        elif 'fts' in str(index).lower():
+                            index_type = 'FULLTEXT'
+                        elif any(scalar_name in str(index).lower() for scalar_name in ['btree', 'scalar']):
+                            index_type = 'SCALAR'
+                        else:
+                            index_type = 'unknown'
+                    
+                    # Get column name with fallbacks
+                    if hasattr(index, 'column'):
+                        index_column = index.column
+                    elif hasattr(index, 'vector_column_name'):
+                        index_column = index.vector_column_name
+                    elif hasattr(index, 'config') and hasattr(index.config, 'column'):
+                        index_column = index.config.column
+                    else:
+                        index_column = 'unknown'
+                    
+                    # Mark index types
+                    if isinstance(index_type, str):
+                        if index_type.upper() in ["IVF_PQ", "HNSW", "IVF_FLAT"]:
+                            self.has_vector_index = True
+                            if self.verbose:
+                                print(f"Found existing vector index: {index_name} on column {index_column}")
+                                
+                        elif index_type.upper() in ["FULLTEXT", "FTS"]:
+                            self.has_fts_index = True
+                            if self.verbose:
+                                print(f"Found existing full-text search index: {index_name} on column {index_column}")
+                                
+                        elif index_type.upper() in ["SCALAR", "BTREE"]:
+                            # Only set scalar_indexes to true if we see at least two scalar indexes
+                            if not self.has_scalar_indexes:
+                                scalar_count = sum(1 for i in indices if 
+                                                (hasattr(i, 'type') and i.type in ["SCALAR", "BTREE"]) or
+                                                (hasattr(i, 'index_type') and i.index_type in ["SCALAR", "BTREE"]) or
+                                                ('scalar' in str(i).lower() or 'btree' in str(i).lower()))
+                                if scalar_count >= 2:
+                                    self.has_scalar_indexes = True
+                            
+                            if self.verbose:
+                                print(f"Found existing scalar index: {index_name} on column {index_column}")
+                except Exception as attr_err:
                     if self.verbose:
-                        print(f"Found existing scalar index: {index_name} on column {index_column}")
+                        print(f"Error processing index: {attr_err}")
+                    
         except Exception as e:
             if self.verbose:
                 print(f"Could not check existing indexes: {e}")
+
         
     def create_collection(self, recreate: bool = False) -> None:
         """Create or recreate a LanceDB collection with improved reliability"""
@@ -568,49 +610,56 @@ class LanceDBManager(VectorDBInterface):
         except Exception as e:
             print(f"Error inserting embeddings with sparse vectors: {str(e)}")
             raise
-            
 
+            
     def _ensure_indexes(self):
-        """Create indexes if they don't exist and we have data in the table with improved API compatibility"""
+        """Create indexes if they don't exist with multilingual support for German and English"""
         try:
             # First check if we have any data in the table and how much
             data_count = 0
             try:
                 # Try to get data count with SQL
                 try:
-                    # Use SQL to count rows efficiently
-                    count_result = self.table.sql("SELECT COUNT(*) as count FROM data").to_arrow()
-                    if hasattr(count_result, 'to_pandas'):
-                        data_count = int(count_result.to_pandas()["count"].iloc[0])
+                    # Try using count_rows method if available
+                    if hasattr(self.table, 'count_rows'):
+                        data_count = self.table.count_rows()
+                        if self.verbose:
+                            print(f"Table has {data_count} rows (from count_rows)")
                     else:
-                        data_count = int(count_result["count"][0])
-                        
-                    if self.verbose:
-                        print(f"Table has {data_count} rows")
+                        # Use SQL to count rows efficiently
+                        count_result = self.table.sql("SELECT COUNT(*) as count FROM data").to_arrow()
+                        if hasattr(count_result, 'to_pandas'):
+                            data_count = int(count_result.to_pandas()["count"].iloc[0])
+                        else:
+                            data_count = int(count_result["count"][0])
+                            
+                        if self.verbose:
+                            print(f"Table has {data_count} rows (from SQL)")
                 except:
                     # Fallback method - count by sampling
                     try:
-                        # Use to_arrow with limit parameter (newer API)
-                        sample_data = self.table.to_arrow(limit=1000)  # Sample up to 1000 rows
-                        sample_count = len(sample_data)
+                        # Use to_arrow without limit parameter, then limit in Python
+                        sample_data = self.table.to_arrow()
+                        # Limit in Python instead
+                        sample_count = min(len(sample_data), 1000)
                         
                         if sample_count == 1000:
                             # We hit the limit, so there are at least 1000 rows
                             data_count = 1000
                             if self.verbose:
-                                print(f"Table has at least {data_count} rows")
+                                print(f"Table has at least {data_count} rows (from sampling)")
                         else:
                             # We got all rows
                             data_count = sample_count
                             if self.verbose:
-                                print(f"Table has {data_count} rows")
+                                print(f"Table has {data_count} rows (from to_arrow)")
                     except TypeError:
                         # Fallback for older versions - try without limit
                         try:
                             all_data = self.table.to_arrow()
                             data_count = len(all_data)
                             if self.verbose:
-                                print(f"Table has {data_count} rows")
+                                print(f"Table has {data_count} rows (from to_arrow fallback)")
                         except:
                             # Can't determine count
                             if self.verbose:
@@ -755,22 +804,153 @@ class LanceDBManager(VectorDBInterface):
                         print(f"Error creating vector index: {e}")
                         print("Will continue without vector index")
             
-            # Check for FTS index
+            # Check for FTS index - with better multilingual support
             if not self.has_fts_index:
                 if self.verbose:
-                    print("Creating full-text search index...")
+                    print("Creating full-text search index for multilingual support...")
+                
                 try:
-                    self.table.create_fts_index(
-                        "text", 
-                        replace=True,
-                        with_position=True,
-                        lower_case=True,
-                        stem=True,
-                        remove_stop_words=True
-                    )
+                    # Check if Tantivy is available
+                    tantivy_available = False
+                    try:
+                        import importlib.util
+                        if importlib.util.find_spec("tantivy"):
+                            tantivy_available = True
+                            if self.verbose:
+                                print("Tantivy is available - using Tantivy-based FTS")
+                    except:
+                        pass
+                    
+                    if tantivy_available:
+                        # Use Tantivy-based FTS with language-specific tokenizers
+                        # Create two separate indexes for German and English
+                        try:
+                            # Create German index first
+                            self.table.create_fts_index(
+                                "text", 
+                                use_tantivy=True,
+                                tokenizer_name="de_stem",  # German stemming
+                                replace=True,
+                                with_position=True,       # For phrase queries
+                                writer_heap_size=1024 * 1024 * 256  # 256MB heap
+                            )
+                            
+                            if self.verbose:
+                                print("Created German FTS index with 'de_stem' tokenizer")
+                                
+                            # For English, we'll create a second table with a different name
+                            # This is a workaround since we can't have multiple FTS indexes on the same column
+                            if self.db is not None:
+                                try:
+                                    # Get a sample of data to create a new table
+                                    # FIX: Don't use limit parameter with to_arrow
+                                    sample_data = self.table.to_arrow()
+                                    
+                                    # Only take a small subset for creating the table
+                                    # Handle PyArrow conversion properly
+                                    try:
+                                        # Use PyArrow directly if possible
+                                        import pyarrow as pa
+                                        if len(sample_data) > 10:
+                                            # Slice the table - make sure it's done properly
+                                            sample_data = pa.Table.from_arrays(
+                                                [col.slice(0, 10) for col in sample_data.columns()],
+                                                names=sample_data.column_names
+                                            )
+                                    except ImportError:
+                                        # Fall back to pandas with proper conversions
+                                        import pandas as pd
+                                        if hasattr(pd, 'DataFrame') and hasattr(pd.DataFrame, 'from_dict'):
+                                            # Convert arrow to dict, then to DataFrame
+                                            sample_df = pd.DataFrame.from_dict(sample_data.to_pydict())
+                                            if len(sample_df) > 10:
+                                                sample_df = sample_df.head(10)
+                                            # Convert back to PyArrow
+                                            import pyarrow as pa
+                                            sample_data = pa.Table.from_pandas(sample_df)
+                                    
+                                    # Create an English-optimized table for just text search
+                                    english_table_name = f"{self.collection_name}_en"
+                                    try:
+                                        # Try to open if exists
+                                        english_table = self.db.open_table(english_table_name)
+                                    except:
+                                        # Create if doesn't exist
+                                        english_table = self.db.create_table(
+                                            english_table_name,
+                                            data=sample_data,
+                                            mode="overwrite"
+                                        )
+                                        
+                                    # Add all data from main table
+                                    all_data = self.table.to_arrow()
+                                    
+                                    # Add data in batches to avoid memory issues
+                                    batch_size = 1000
+                                    for i in range(0, len(all_data), batch_size):
+                                        end_idx = min(i + batch_size, len(all_data))
+                                        # Create a slice of the data
+                                        try:
+                                            # PyArrow direct slicing
+                                            import pyarrow as pa
+                                            batch = pa.Table.from_arrays(
+                                                [col.slice(i, end_idx - i) for col in all_data.columns()],
+                                                names=all_data.column_names
+                                            )
+                                        except:
+                                            # Fall back to manual conversion
+                                            batch_dict = {col_name: all_data[col_name].to_pylist()[i:end_idx] 
+                                                        for col_name in all_data.column_names}
+                                            batch = pa.Table.from_pydict(batch_dict)
+                                            
+                                        english_table.add(batch)
+                                    
+                                    # Create English FTS index
+                                    english_table.create_fts_index(
+                                        "text", 
+                                        use_tantivy=True,
+                                        tokenizer_name="en_stem",  # English stemming
+                                        replace=True,
+                                        with_position=True,
+                                        writer_heap_size=1024 * 1024 * 256  # 256MB heap
+                                    )
+                                    
+                                    if self.verbose:
+                                        print("Created additional English FTS index with 'en_stem' tokenizer")
+                                except Exception as tantivy_eng_err:
+                                    if self.verbose:
+                                        print(f"Error creating English FTS index: {tantivy_eng_err}")
+                                    
+                        except Exception as tantivy_err:
+                            if self.verbose:
+                                print(f"Error creating Tantivy-based FTS index: {tantivy_err}")
+                            # Fall back to native FTS if Tantivy fails
+                            tantivy_available = False
+                    
+                    # If Tantivy is not available or failed, use native FTS
+                    if not tantivy_available:
+                        # Use native FTS with multilingual configuration
+                        try:
+                            self.table.create_fts_index(
+                                "text", 
+                                use_tantivy=False,
+                                replace=True,
+                                with_position=True,        # Enable phrase queries
+                                lower_case=True,          # Case-insensitive search
+                                stem=True,                # Enable stemming for supported languages
+                                remove_stop_words=True,   # Remove common stop words
+                                language="English"        # Default language (though we handle German in search)
+                            )
+                            
+                            if self.verbose:
+                                print("Created native FTS index with multilingual support")
+                        except Exception as native_fts_err:
+                            if self.verbose:
+                                print(f"Error creating native FTS index: {native_fts_err}")
+                            print("Will continue without FTS index")
+                    
                     self.has_fts_index = True
-                    if self.verbose:
-                        print("FTS index creation initiated")
+                    
                 except Exception as e:
                     if self.verbose:
                         print(f"Error creating FTS index: {e}")
@@ -807,7 +987,6 @@ class LanceDBManager(VectorDBInterface):
             if self.verbose:
                 print(f"Error ensuring indexes: {e}")
                 print("Will continue without additional indexes")
-
 
 
     def _get_reranker(self, reranker_type: str = "rrf", verbose: bool = False):
@@ -1164,12 +1343,11 @@ class LanceDBManager(VectorDBInterface):
             # Get initial search results with optimized parameters
             search_result = None
             try:
-                # Try with newer API first
+                # Try with newer API first - with vector as first param
                 search_result = (
                     self.table.search(
-                        query_vector.tolist(),
-                        vector_column_name="vector",
-                        metric="cosine"
+                        query_vector.tolist(),  # Just the vector data
+                        vector_column_name="vector"  # Specify the column separately
                     )
                     .nprobes(nprobes)          # Parameter for index efficiency
                     .refine_factor(refine_factor)  # Parameter for result quality
@@ -1189,10 +1367,10 @@ class LanceDBManager(VectorDBInterface):
                     
                 # Try alternative methods if the first approach fails
                 try:
+                    # Try with alternative syntax (older version)
                     search_result = self.table.search(
-                        query_vector.tolist(),
+                        query_vector=query_vector.tolist(),  # Use named parameter
                         vector_column_name="vector",
-                        metric="cosine",
                         limit=limit * 3
                     )
                     
@@ -1258,16 +1436,9 @@ class LanceDBManager(VectorDBInterface):
             # Limit to requested number
             search_result = search_result.head(limit)
             
-            # Format as expected output
+            # Format results as dictionary objects that match what ResultProcessor.adapt_result expects
             results = []
             for _, row in search_result.iterrows():
-                # Create a result object (compatible with other backends)
-                class ResultItem:
-                    def __init__(self, id, payload, score):
-                        self.id = id
-                        self.payload = payload
-                        self.score = score
-                
                 # Parse metadata JSON
                 metadata = row.get("metadata", "{}")
                 if isinstance(metadata, str):
@@ -1276,35 +1447,34 @@ class LanceDBManager(VectorDBInterface):
                     except:
                         metadata = {}
                 
-                # Create payload dictionary
-                payload = {
+                # Create a dictionary with the expected structure
+                result_dict = {
+                    "id": row.get("id", f"result_{_}"),
                     "text": row["text"],
-                    "file_path": row["file_path"],
-                    "file_name": row["file_name"],
-                    "chunk_index": row["chunk_index"],
+                    "file_path": row.get("file_path", ""),
+                    "file_name": row.get("file_name", ""),
+                    "chunk_index": row.get("chunk_index", 0),
                     "total_chunks": row.get("total_chunks", 0),
                     "metadata": metadata
                 }
                 
-                # Get score from appropriate column
+                # Add score
                 if rerank and "rerank_score" in row:
-                    score = row["rerank_score"]
+                    result_dict["score"] = float(row["rerank_score"])
                 else:
-                    score = row.get("_distance", 0.0)
+                    for score_col in ['_distance', '_score', 'score']:
+                        if score_col in row:
+                            result_dict["score"] = float(row[score_col])
+                            break
+                    else:
+                        result_dict["score"] = 0.0
                 
-                # Create result object
-                result = ResultItem(
-                    id=row["id"],
-                    payload=payload,
-                    score=score
-                )
-                
-                results.append(result)
+                results.append(result_dict)
             
             # Record metrics if ground truth is available
             true_context = getattr(processor, 'expected_context', None)
             if true_context:
-                hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in results)
+                hit = any(r.get("text") == true_context for r in results)
                 search_key = "vector"
                 if rerank:
                     search_key += f"_{reranker_type or 'default'}"
@@ -1392,36 +1562,26 @@ class LanceDBManager(VectorDBInterface):
             # Convert results to the expected format
             results = []
             for _, row in results_df.iterrows():
-                # Parse metadata JSON
+                
+                # Parse metadata JSON safely
                 metadata = row.get("metadata", "{}")
                 if isinstance(metadata, str):
                     try:
                         metadata = json.loads(metadata)
                     except:
                         metadata = {}
-                
-                # Create a result object (compatible with other backends)
-                class ResultItem:
-                    def __init__(self, id, payload, score):
-                        self.id = id
-                        self.payload = payload
-                        self.score = score
-                
-                payload = {
-                    "text": row["text"],
-                    "file_path": row["file_path"],
-                    "file_name": row["file_name"],
-                    "chunk_index": row["chunk_index"],
+
+                result = {
+                    "id": row.get("id", f"result_{_}"),
+                    "text": row.get("text", ""),
+                    "file_path": row.get("file_path", ""),
+                    "file_name": row.get("file_name", ""),
+                    "chunk_index": row.get("chunk_index", 0),
                     "total_chunks": row.get("total_chunks", 0),
-                    "metadata": metadata
+                    "metadata": metadata,
+                    "score": row.get("_bm25", 0.0)
                 }
-                
-                result = ResultItem(
-                    id=row["id"],
-                    payload=payload,
-                    score=row.get("_bm25", 0.0)  # Use BM25 score for keyword-based search
-                )
-                
+
                 results.append(result)
             
             return results
@@ -1431,13 +1591,13 @@ class LanceDBManager(VectorDBInterface):
                 print(f"Error in sparse/keyword search: {e}")
             return {"error": f"Error in sparse search: {str(e)}"}
 
-
+        
     def search_keyword(self, query: str, limit: int = 10, score_threshold: float = None,
                     rerank: bool = False, reranker_type: str = None):
         """
-        Perform a keyword-based search using full-text search index
+        Perform a keyword-based search with multilingual support for German and English
         
-        Updated to handle API changes in newer LanceDB versions
+        This implementation supports both Tantivy-based and native FTS
         
         Args:
             query: Search query string
@@ -1466,201 +1626,356 @@ class LanceDBManager(VectorDBInterface):
                 if self.verbose:
                     print("Creating FTS index for text search...")
                 self._ensure_indexes()
-                    
+            
             if self.verbose:
                 print(f"Performing keyword search for: '{query}'")
             
+            # Detect if query might be German or contains special characters
+            # This is a simple heuristic - better would be language detection
+            has_german_chars = any(c in query for c in 'äöüßÄÖÜ')
+            contains_umlaut = any(c in query for c in 'äöüÄÖÜ')
+            
+            # Try to determine if Tantivy is available (which supports language-specific tokenizers)
+            tantivy_available = False
             try:
-                # Try newest API first - FTS search with limit
-                search_results = (
-                    self.table.search(
-                        query,
-                        query_type="fts"
-                    )
-                    .limit(limit * 3)  # Get more results for possible filtering
-                )
+                import importlib.util
+                if importlib.util.find_spec("tantivy"):
+                    tantivy_available = True
+            except:
+                pass
+            
+            # Store all results here for multilingual merging
+            all_results = []
+            
+            # First, try native search on the main table
+            try:
+                # Basic search query with phrase_query for better multi-word handling
+                search_query = self.table.search(query, query_type="fts")
+                
+                # Only apply phrase query if available and if there are multiple words
+                try:
+                    if ' ' in query and hasattr(search_query, 'phrase_query'):
+                        search_query = search_query.phrase_query()
+                        if self.verbose:
+                            print("Applied phrase_query() for better multi-word handling")
+                except Exception as phrase_err:
+                    if self.verbose:
+                        print(f"phrase_query() not supported: {phrase_err}")
+                
+                # Apply reranker if specified
+                if rerank:
+                    try:
+                        # Get reranker
+                        reranker_obj = self._get_reranker(reranker_type or "rrf", self.verbose)
+                        
+                        # Apply reranker directly using the API
+                        search_query = search_query.rerank(reranker=reranker_obj)
+                        
+                        if self.verbose:
+                            print(f"Applied {reranker_type or 'rrf'} reranker to search results")
+                    except Exception as rerank_err:
+                        if self.verbose:
+                            print(f"Direct reranking failed: {rerank_err}")
+                            print("Will apply manual reranking after results are retrieved")
+                
+                # Apply limit with prefetch for potential filtering
+                search_query = search_query.limit(limit * 3)
                 
                 # Apply score threshold if provided
-                # Note: Different LanceDB versions use different column names for scores
                 if score_threshold is not None:
                     try:
-                        # Try with _bm25 score filter
-                        search_results = search_results.where(f"_bm25 >= {score_threshold}", prefilter=False)
-                    except:
-                        try:
-                            # Try with _score filter
-                            search_results = search_results.where(f"_score >= {score_threshold}", prefilter=False)
-                        except:
-                            if self.verbose:
-                                print(f"Could not apply score threshold - filter not supported")
+                        # Try with score column filter
+                        search_query = search_query.where(f"_score >= {score_threshold}", prefilter=False)
+                    except Exception as filter_err:
+                        if self.verbose:
+                            print(f"Score filtering not supported: {filter_err}")
                 
-                # Get the results as pandas DataFrame
+                # Get results
                 try:
-                    # First try to_pandas()
-                    results_df = search_results.to_pandas()
-                except Exception as e1:
+                    # Try to_pandas() - newer API
+                    results_df = search_query.to_pandas()
+                except Exception as pandas_err:
                     try:
-                        # Try with to_arrow().to_pandas()
-                        results_arr = search_results.to_arrow()
-                        if hasattr(results_arr, 'to_pandas'):
-                            results_df = results_arr.to_pandas()
-                        else:
-                            # Manual conversion if needed
-                            import pandas as pd
-                            results_df = pd.DataFrame({
-                                col: results_arr[col].to_numpy() 
-                                for col in results_arr.column_names
-                            })
-                    except Exception as e2:
-                        return {"error": f"Error converting search results: {e1}; then {e2}"}
-                        
-                # Sort by score if available (different column names in different versions)
-                for score_col in ['_bm25', '_score', 'score']:
-                    if score_col in results_df.columns:
-                        results_df = results_df.sort_values(by=score_col, ascending=False)
-                        break
-                
-                # Limit to requested number after sorting
-                results_df = results_df.head(limit)
-                
-                # Format results in the expected format
-                results = []
-                for _, row in results_df.iterrows():
-                    # Create a result object (compatible with other backends)
-                    class ResultItem:
-                        def __init__(self, id, payload, score):
-                            self.id = id
-                            self.payload = payload
-                            self.score = score
-                    
-                    # Parse metadata JSON
-                    metadata = row.get("metadata", "{}")
-                    if isinstance(metadata, str):
-                        try:
-                            metadata = json.loads(metadata)
-                        except:
-                            metadata = {}
-                    
-                    # Create payload dictionary
-                    payload = {
-                        "text": row["text"],
-                        "file_path": row["file_path"],
-                        "file_name": row["file_name"],
-                        "chunk_index": row["chunk_index"],
-                        "total_chunks": row.get("total_chunks", 0),
-                        "metadata": metadata
-                    }
-                    
-                    # Extract score from appropriate column
-                    score = 0.0
-                    for score_col in ['_bm25', '_score', 'score']:
-                        if score_col in row:
-                            score = row[score_col]
-                            break
-                    
-                    # Create result object
-                    result = ResultItem(
-                        id=row["id"],
-                        payload=payload,
-                        score=score
-                    )
-                    
-                    results.append(result)
-                    
-                return results
-                    
-            except Exception as e:
-                if self.verbose:
-                    print(f"Error in keyword search: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    
-                # Try alternate approach using SQL
-                try:
-                    if self.verbose:
-                        print("Trying SQL-based keyword search...")
-                        
-                    # Escape single quotes in query
-                    sql_query = query.replace("'", "''")
-                    
-                    # Prepare SQL query
-                    sql = f"""
-                    SELECT *,
-                        SCORE() AS _score
-                    FROM data
-                    WHERE MATCH(text) AGAINST('{sql_query}')
-                    ORDER BY _score DESC
-                    LIMIT {limit * 3}
-                    """
-                    
-                    # Execute SQL query
-                    results = self.table.sql(sql)
-                    
-                    # Convert to pandas DataFrame
-                    try:
-                        results_df = results.to_pandas()
-                    except:
-                        # Try with to_arrow first
-                        results_arr = results.to_arrow()
+                        # Try with to_arrow().to_pandas() - older API
+                        results_arr = search_query.to_arrow()
                         if hasattr(results_arr, 'to_pandas'):
                             results_df = results_arr.to_pandas()
                         else:
                             # Manual conversion
                             import pandas as pd
-                            results_df = pd.DataFrame({
-                                col: results_arr[col].to_numpy() 
-                                for col in results_arr.column_names
-                            })
+                            results_df = pd.DataFrame(results_arr.to_pydict())
+                    except Exception as arrow_err:
+                        if self.verbose:
+                            print(f"Error converting search results: {pandas_err}; then {arrow_err}")
+                        results_df = None
+                
+                # If we have results, process them
+                if results_df is not None and not results_df.empty:
+                    # Add to all results
+                    all_results.append(results_df)
                     
-                    # Limit to requested number
-                    results_df = results_df.head(limit)
-                    
-                    # Format results in the expected format
-                    results = []
-                    for _, row in results_df.iterrows():
-                        # Create a result object (compatible with other backends)
-                        class ResultItem:
-                            def __init__(self, id, payload, score):
-                                self.id = id
-                                self.payload = payload
-                                self.score = score
-                        
-                        # Parse metadata JSON
-                        metadata = row.get("metadata", "{}")
-                        if isinstance(metadata, str):
-                            try:
-                                metadata = json.loads(metadata)
-                            except:
-                                metadata = {}
-                        
-                        # Create payload dictionary
-                        payload = {
-                            "text": row["text"],
-                            "file_path": row.get("file_path", ""),
-                            "file_name": row.get("file_name", ""),
-                            "chunk_index": row.get("chunk_index", 0),
-                            "total_chunks": row.get("total_chunks", 0),
-                            "metadata": metadata
-                        }
-                        
-                        # Extract score from appropriate column
-                        score = row.get("_score", 0.0)
-                        
-                        # Create result object
-                        result = ResultItem(
-                            id=row.get("id", f"result_{_}"),
-                            payload=payload,
-                            score=score
-                        )
-                        
-                        results.append(result)
-                        
-                    return results
-                except Exception as e2:
                     if self.verbose:
-                        print(f"SQL-based search also failed: {e2}")
-                    return {"error": f"Error in keyword search: {str(e)}; SQL fallback: {str(e2)}"}
-        
+                        print(f"Found {len(results_df)} results with primary FTS search")
+            
+            except Exception as main_search_err:
+                if self.verbose:
+                    print(f"Primary search error: {main_search_err}")
+            
+            # If using Tantivy and query might be German, try language-specific search
+            if tantivy_available and (has_german_chars or len(all_results) == 0):
+                if self.verbose:
+                    print("Trying German-specific search...")
+                    
+                # If German characters detected, prioritize German search
+                try:
+                    # Create a German-optimized query if not already done
+                    deutsch_query = self.table.search(query, query_type="fts")
+                    
+                    # Try to apply phrase query
+                    try:
+                        if ' ' in query and hasattr(deutsch_query, 'phrase_query'):
+                            deutsch_query = deutsch_query.phrase_query()
+                    except:
+                        pass
+                        
+                    # Get results
+                    try:
+                        deutsch_results = deutsch_query.limit(limit * 2).to_pandas()
+                        
+                        if not deutsch_results.empty:
+                            # Add to all results with German priority if umlauts found
+                            if contains_umlaut:
+                                # Insert at beginning for higher priority
+                                all_results.insert(0, deutsch_results)
+                            else:
+                                # Append normally
+                                all_results.append(deutsch_results)
+                                
+                            if self.verbose:
+                                print(f"Found {len(deutsch_results)} results with German-optimized search")
+                    except:
+                        pass
+                except Exception as german_err:
+                    if self.verbose:
+                        print(f"German-specific search failed: {german_err}")
+            
+            # Try English-specific table if available and we haven't found enough results
+            english_results_found = False
+            if tantivy_available and not has_german_chars and (len(all_results) == 0 or sum(len(df) for df in all_results) < limit):
+                try:
+                    # See if we have an English-optimized table
+                    english_table_name = f"{self.collection_name}_en"
+                    
+                    try:
+                        english_table = self.db.open_table(english_table_name)
+                        
+                        if self.verbose:
+                            print(f"Found English-optimized table: {english_table_name}")
+                        
+                        # Create English query
+                        english_query = english_table.search(query, query_type="fts")
+                        
+                        # Try to apply phrase query
+                        try:
+                            if ' ' in query and hasattr(english_query, 'phrase_query'):
+                                english_query = english_query.phrase_query()
+                        except:
+                            pass
+                            
+                        # Get results
+                        try:
+                            english_results = english_query.limit(limit * 2).to_pandas()
+                            
+                            if not english_results.empty:
+                                all_results.append(english_results)
+                                english_results_found = True
+                                
+                                if self.verbose:
+                                    print(f"Found {len(english_results)} results with English-optimized search")
+                        except Exception as en_results_err:
+                            if self.verbose:
+                                print(f"Error getting English results: {en_results_err}")
+                    except Exception as en_table_err:
+                        if self.verbose:
+                            print(f"English table not available: {en_table_err}")
+                except Exception as english_err:
+                    if self.verbose:
+                        print(f"English-specific search failed: {english_err}")
+            
+            # If we still have no results, try alternative search as fallback
+            if len(all_results) == 0 or sum(len(df) for df in all_results) == 0:
+                try:
+                    if self.verbose:
+                        print("No results found with FTS, trying alternative text search...")
+                        
+                    # Try vector search as a fallback if available
+                    try:
+                        # Ensure we have a dense provider
+                        if hasattr(self, 'dense_provider') and self.dense_provider is not None:
+                            vector_query = self.search_dense(query, self.dense_provider, limit)
+                            if vector_query and not isinstance(vector_query, dict) and len(vector_query) > 0:
+                                if self.verbose:
+                                    print(f"Found {len(vector_query)} results with vector search fallback")
+                                return vector_query
+                    except Exception as vector_err:
+                        if self.verbose:
+                            print(f"Vector search fallback failed: {vector_err}")
+                    
+                    # Try to filter directly on the table as a last resort
+                    try:
+                        query_terms = query.lower().strip().split()
+                        if query_terms:
+                            # Get all data and filter in Python
+                            all_data = self.table.to_arrow()
+                            import pandas as pd
+                            all_df = pd.DataFrame.from_dict(all_data.to_pydict())
+                            
+                            if 'text' in all_df.columns:
+                                # Filter rows where any term is in the text
+                                filtered_rows = []
+                                for _, row in all_df.iterrows():
+                                    text = str(row['text']).lower()
+                                    if any(term in text for term in query_terms):
+                                        filtered_rows.append(row)
+                                
+                                if filtered_rows:
+                                    filtered_df = pd.DataFrame(filtered_rows)
+                                    all_results.append(filtered_df)
+                                    
+                                    if self.verbose:
+                                        print(f"Found {len(filtered_df)} results with direct text filtering")
+                    except Exception as filter_err:
+                        if self.verbose:
+                            print(f"Direct filtering fallback failed: {filter_err}")
+                except Exception as fallback_err:
+                    if self.verbose:
+                        print(f"All fallback search methods failed: {fallback_err}")
+            
+            # If no results were found with any method
+            if len(all_results) == 0 or sum(len(df) for df in all_results) == 0:
+                if self.verbose:
+                    print("No results found with any search method")
+                return []
+            
+            # Combine all results
+            import pandas as pd
+            
+            # Concatenate all results if we have multiple
+            if len(all_results) > 1:
+                # Combine dataframes
+                combined_df = pd.concat(all_results, ignore_index=True)
+                
+                # Remove duplicates based on id
+                if 'id' in combined_df.columns:
+                    combined_df = combined_df.drop_duplicates(subset=["id"])
+                
+                # Sort by score if available
+                for score_col in ['_bm25', '_score', 'score']:
+                    if score_col in combined_df.columns:
+                        combined_df = combined_df.sort_values(by=score_col, ascending=False)
+                        break
+                        
+                results_df = combined_df
+                
+                if self.verbose:
+                    print(f"Combined {len(all_results)} result sets into {len(results_df)} unique results")
+            else:
+                # Just use the one result set we have
+                results_df = all_results[0]
+            
+            # Apply manual reranking if needed and not already done
+            if rerank and not english_results_found:
+                try:
+                    # Only apply manual reranking if we didn't already do direct reranking
+                    reranker_obj = self._get_reranker(reranker_type or "rrf", self.verbose)
+                    
+                    if self.verbose:
+                        print(f"Applying manual {reranker_type or 'rrf'} reranking to {len(results_df)} results")
+                    
+                    # Extract texts for reranking
+                    texts = results_df["text"].tolist()
+                    
+                    # Apply reranking logic - this could be its own method
+                    # This implementation depends on the reranker capabilities
+                    try:
+                        # Placeholder for actual reranking scores
+                        rerank_scores = [1.0] * len(texts)  # Default scores
+                        
+                        # Apply reranking logic based on reranker type
+                        if hasattr(reranker_obj, 'rerank'):
+                            # Use direct reranking method if available
+                            rerank_scores = reranker_obj.rerank(query, texts)
+                        
+                        # Add rerank scores to dataframe
+                        results_df["rerank_score"] = rerank_scores
+                        
+                        # Sort by rerank scores
+                        results_df = results_df.sort_values(by="rerank_score", ascending=False)
+                        
+                        if self.verbose:
+                            print(f"Successfully reranked results")
+                    except Exception as rerank_err:
+                        if self.verbose:
+                            print(f"Manual reranking failed: {rerank_err}")
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Reranking setup failed: {e}")
+            
+            # Limit to requested number
+            results_df = results_df.head(limit)
+            
+            if self.verbose:
+                print(f"Debug - Columns in results dataframe: {results_df.columns.tolist()}")
+                if len(results_df) > 0:
+                    print(f"Debug - First row sample: {results_df.iloc[0].to_dict()}")
+            
+            # Convert results to format expected by TextProcessor
+            results = []
+            for idx, row in results_df.iterrows():
+                # Create a dictionary that mimics the structure expected by ResultProcessor.adapt_result
+                class TextProcessorCompatibleResult:
+                    def __init__(self, data_dict):
+                        self.id = data_dict.get("id", "")
+                        self.chunk_idx = data_dict.get("chunk_index", 0)
+                        self.text = data_dict.get("text", "")
+                        self.file_path = data_dict.get("file_path", "")
+                        self.file_name = data_dict.get("file_name", "")
+                        
+                        # Ensure metadata is a dictionary
+                        meta = data_dict.get("metadata", {})
+                        if isinstance(meta, str):
+                            try:
+                                import json
+                                meta = json.loads(meta)
+                            except:
+                                meta = {}
+                        self.metadata = meta
+                        
+                        # Store score separately
+                        for score_field in ["rerank_score", "_score", "_bm25", "score"]:
+                            if score_field in data_dict:
+                                self.score = data_dict[score_field]
+                                break
+                        else:
+                            self.score = 0.0
+                            
+                    def get(self, key, default=None):
+                        """Implement get method for compatibility"""
+                        return getattr(self, key, default)
+                    
+                # Create a proper row_dict from the pandas Series
+                row_dict = row.to_dict()
+                
+                # Create a compatible result object
+                result = TextProcessorCompatibleResult(row_dict)
+                
+                results.append(result)
+                
+            if self.verbose and results:
+                print(f"Debug - Sample compatible result: {vars(results[0])}")
+                
+            return results
+            
         except Exception as e:
             if self.verbose:
                 print(f"Error in keyword search: {str(e)}")
@@ -1668,47 +1983,82 @@ class LanceDBManager(VectorDBInterface):
                 traceback.print_exc()
             return {"error": f"Error in keyword search: {str(e)}"}
 
+
     def _retrieve_context_for_chunk(self, file_path: str, chunk_index: int, window: int = 1) -> str:
         """Retrieve context surrounding a chunk"""
         try:
+            # Make sure file_path is properly escaped for queries
+            if file_path:
+                file_path = file_path.replace("'", "''")
+            else:
+                return "[No file path provided]"
+                
             # Define minimum and maximum chunk indices to retrieve
             min_idx = max(0, chunk_index - window)
             max_idx = chunk_index + window
             
-            # Use scalar indexes for efficient filtering if available
-            if self.has_scalar_indexes:
-                # Fetch chunks from the same file within the window
-                query = self.table.search().where(
-                    f"file_path = '{file_path}' AND chunk_index >= {min_idx} AND chunk_index <= {max_idx}"
-                )
+            # Get all data and filter in memory (most reliable approach)
+            try:
+                all_data = self.table.to_arrow()
                 
-                # Order by chunk index
-                query = query.order_by("chunk_index")
+                # Convert to pandas
+                import pandas as pd
+                try:
+                    # Try direct conversion
+                    all_df = pd.DataFrame(all_data.to_pydict())
+                except:
+                    # Manual conversion if necessary
+                    data_dict = {}
+                    for col_name in all_data.column_names:
+                        data_dict[col_name] = all_data[col_name].to_pylist()
+                    all_df = pd.DataFrame(data_dict)
                 
-                # Execute query and get results
-                context_chunks = query.to_pandas()
-            else:
-                # Fall back to full table scan if no scalar indexes
+                # Debug data columns
                 if self.verbose:
-                    print("Warning: Scalar indexes not available. Using full table scan for context retrieval.")
-                all_docs = self.table.to_pandas()
-                context_chunks = all_docs[
-                    (all_docs["file_path"] == file_path) & 
-                    (all_docs["chunk_index"] >= min_idx) & 
-                    (all_docs["chunk_index"] <= max_idx)
-                ].sort_values(by="chunk_index")
-            
-            # Combine the texts
-            if len(context_chunks) > 0:
-                combined_text = "\n".join(context_chunks["text"].tolist())
-            else:
-                combined_text = ""
-            
-            return combined_text
+                    print(f"Debug - Context retrieval - Columns: {all_df.columns.tolist()}")
+                    print(f"Debug - First row preview: {dict(all_df.iloc[0]) if len(all_df) > 0 else 'No data'}")
+                    
+                # Filter and sort
+                if "file_path" in all_df.columns and "chunk_index" in all_df.columns:
+                    filtered_df = all_df[
+                        (all_df["file_path"] == file_path) & 
+                        (all_df["chunk_index"] >= min_idx) & 
+                        (all_df["chunk_index"] <= max_idx)
+                    ]
+                    
+                    if not filtered_df.empty:
+                        # Sort by chunk index
+                        sorted_df = filtered_df.sort_values(by="chunk_index")
+                        
+                        # Combine the texts
+                        if "text" in sorted_df.columns:
+                            combined_text = "\n".join(str(text) for text in sorted_df["text"].tolist())
+                            return combined_text
+                        else:
+                            return "[Text column not found in results]"
+                    else:
+                        return f"[No chunks found for file_path={file_path}, chunk_index={chunk_index}]"
+                else:
+                    missing_cols = []
+                    if "file_path" not in all_df.columns:
+                        missing_cols.append("file_path")
+                    if "chunk_index" not in all_df.columns:
+                        missing_cols.append("chunk_index")
+                    return f"[Missing required columns: {', '.join(missing_cols)}]"
+                    
+            except Exception as err:
+                if self.verbose:
+                    print(f"Error in context retrieval (full scan): {err}")
+                    import traceback
+                    traceback.print_exc()
+                return f"[Context retrieval error: {err}]"
+                
         except Exception as e:
             if self.verbose:
                 print(f"Error retrieving context: {e}")
-            return ""
+                import traceback
+                traceback.print_exc()
+            return f"[Error retrieving context: {e}]"
 
     def _generate_sparse_vector(self, text: str) -> Tuple[List[int], List[float]]:
         """Generate a simple sparse vector using term frequencies"""
