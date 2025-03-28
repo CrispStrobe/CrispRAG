@@ -2,4 +2,4 @@ __pycache__/
 weights/
 qdrant_storage/
 lancedb_storage/
-
+arch*.md
