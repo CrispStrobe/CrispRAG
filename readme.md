@@ -117,6 +117,88 @@ python mlxrag.py list-models
 python mlxrag.py list-dbs
 ```
 
+### Examples
+
+For milvus, you might want to create a docker-compose.yml like:
+
+```
+services:
+  milvus-etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_UNSUPPORTED_ARCH: arm64
+    command: >
+      etcd
+      --name milvus-etcd
+      --data-dir /etcd
+      --listen-client-urls http://0.0.0.0:2379
+      --advertise-client-urls http://milvus-etcd:2379
+      --listen-peer-urls http://0.0.0.0:2380
+      --initial-advertise-peer-urls http://milvus-etcd:2380
+      --initial-cluster milvus-etcd=http://milvus-etcd:2380
+    volumes:
+      - etcd-data:/etcd
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    networks:
+      - milvus-network
+
+  minio:
+    container_name: minio
+    image: minio/minio:RELEASE.2023-12-02T10-51-33Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - milvus-network
+
+  milvus:
+    container_name: milvus
+    image: milvusdb/milvus:v2.3.9
+    command: ["milvus", "run", "standalone"]
+    depends_on:
+      - milvus-etcd
+      - minio
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MILVUS_DEPLOY_MODE: standalone
+      MILVUS_ENABLE_EMBEDDED_COORDINATORS: "true"
+      MILVUS_LOG_LEVEL: debug
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    networks:
+      - milvus-network
+
+volumes:
+  etcd-data:
+  minio-data:
+
+networks:
+  milvus-network:
+```
+
+then:
+```bash
+docker compose down
+docker compose up -d
+python mlxrag.py --verbose --use-mlx-models --db-type milvus index ~/Documents/texte --include "*.txt *.pdf" --limit 5 --recreate
+```
+
 ## Architecture
 
 The project follows a modular architecture:

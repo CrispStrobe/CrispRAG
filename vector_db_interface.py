@@ -82,7 +82,7 @@ class DBFactory:
         are missing.
         
         Args:
-            db_type: Type of database to create ("qdrant", "lancedb", "meilisearch", "elasticsearch", "chromadb")
+            db_type: Type of database to create ("qdrant", "lancedb", "meilisearch", "elasticsearch", "chromadb", "milvus")
             **kwargs: Additional arguments for database initialization
                 
         Returns:
@@ -109,7 +109,9 @@ class DBFactory:
             "elasticsearch": {"module": "elasticsearch_manager", "class": "ElasticsearchManager", 
                             "dependencies": ["elasticsearch"]},
             "chromadb": {"module": "chromadb_manager", "class": "ChromaDBManager",
-                       "dependencies": ["chromadb"]}
+                       "dependencies": ["chromadb"]},
+            "milvus": {"module": "milvus_manager", "class": "MilvusManager",
+                       "dependencies": ["pymilvus"]}
         }
         
         # Check if the requested database type is supported
@@ -137,6 +139,12 @@ class DBFactory:
                 import chromadb
             except ImportError:
                 raise ValueError(f"ChromaDB support not available. Install with: pip install chromadb")
+                
+        if db_type == "milvus":
+            try:
+                import pymilvus
+            except ImportError:
+                raise ValueError(f"Milvus support not available. Install with: pip install pymilvus")
         
         try:
             # Import specific database module based on type
@@ -166,6 +174,12 @@ class DBFactory:
                     return ChromaDBManager(**kwargs)
                 except ImportError:
                     raise ValueError("ChromaDB support not available. Install with: pip install chromadb")
+            elif db_type == "milvus":
+                try:
+                    from milvus_manager import MilvusManager
+                    return MilvusManager(**kwargs)
+                except ImportError:
+                    raise ValueError("Milvus support not available. Install with: pip install pymilvus")
             else:
                 # This should never happen due to the earlier check, but just in case
                 raise ValueError(f"Unsupported database type: {db_type}")

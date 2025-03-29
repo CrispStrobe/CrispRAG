@@ -173,6 +173,15 @@ def run_search(args):
             "username": args.es_username,
             "password": args.es_password,
         })
+    elif db_type.lower() == 'milvus':
+        db_args.update({
+            "host": args.milvus_host,
+            "port": args.milvus_port,
+            "user": args.milvus_user,
+            "password": args.milvus_password,
+            "secure": args.milvus_secure,
+            "token": args.milvus_token,
+        })
         
     # Create the database handler using the factory
     try:
@@ -491,6 +500,15 @@ def run_indexing(args):
                 "username": args.es_username,
                 "password": args.es_password,
             })
+        elif db_type.lower() == 'milvus':
+            db_args.update({
+                "host": args.milvus_host,
+                "port": args.milvus_port,
+                "user": args.milvus_user,
+                "password": args.milvus_password,
+                "secure": args.milvus_secure,
+                "token": args.milvus_token,
+            })
             
         # Create the database handler using the factory
         if args.verbose:
@@ -668,7 +686,7 @@ def main():
     parser.add_argument("--storage-path", help="Path to store database data")
     
     # Add database selection option
-    parser.add_argument("--db-type", choices=["qdrant", "lancedb", "meilisearch", "elasticsearch", "chromadb"], 
+    parser.add_argument("--db-type", choices=["qdrant", "lancedb", "meilisearch", "elasticsearch", "chromadb", "milvus"], 
                     default="qdrant", help="Vector database backend to use")
 
     # Create embedding provider group with mutually exclusive options
@@ -760,6 +778,21 @@ def main():
     es_group.add_argument("--es-username", dest="es_username", type=str, help="Elasticsearch username")
     es_group.add_argument("--es-password", dest="es_password", type=str, help="Elasticsearch password")
 
+    # Add database-specific parameters for Milvus for the index_parser
+    milvus_group = index_parser.add_argument_group("Milvus options")
+    milvus_group.add_argument("--milvus-host", dest="milvus_host", type=str, 
+                            default="localhost", help="Milvus host")
+    milvus_group.add_argument("--milvus-port", dest="milvus_port", type=str, 
+                            default="19530", help="Milvus port")
+    milvus_group.add_argument("--milvus-user", dest="milvus_user", type=str, 
+                            default="", help="Milvus username for authentication")
+    milvus_group.add_argument("--milvus-password", dest="milvus_password", type=str, 
+                            default="", help="Milvus password for authentication")
+    milvus_group.add_argument("--milvus-secure", dest="milvus_secure", action="store_true",
+                            help="Use secure connection to Milvus")
+    milvus_group.add_argument("--milvus-token", dest="milvus_token", type=str,
+                            help="Milvus auth token (alternative to username/password)")
+
     # Add database-specific parameters for ChromaDB in the index_parser
     chromadb_group = index_parser.add_argument_group("ChromaDB options")
     chromadb_group.add_argument("--chromadb-host", dest="chromadb_host", type=str, 
@@ -830,6 +863,21 @@ def main():
     es_search_group.add_argument("--es-api-key", dest="es_api_key", type=str, help="Elasticsearch API key")
     es_search_group.add_argument("--es-username", dest="es_username", type=str, help="Elasticsearch username")
     es_search_group.add_argument("--es-password", dest="es_password", type=str, help="Elasticsearch password")
+
+    # Add database-specific parameters for search with Milvus
+    milvus_search_group = search_parser.add_argument_group("Milvus options")
+    milvus_search_group.add_argument("--milvus-host", dest="milvus_host", type=str, 
+                                default="localhost", help="Milvus host")
+    milvus_search_group.add_argument("--milvus-port", dest="milvus_port", type=str, 
+                                default="19530", help="Milvus port")
+    milvus_search_group.add_argument("--milvus-user", dest="milvus_user", type=str, 
+                                default="", help="Milvus username for authentication")
+    milvus_search_group.add_argument("--milvus-password", dest="milvus_password", type=str, 
+                                default="", help="Milvus password for authentication")
+    milvus_search_group.add_argument("--milvus-secure", dest="milvus_secure", action="store_true",
+                                help="Use secure connection to Milvus")
+    milvus_search_group.add_argument("--milvus-token", dest="milvus_token", type=str,
+                                help="Milvus auth token (alternative to username/password)")
 
     # add ChromaDB options to the search_parser
     chromadb_search_group = search_parser.add_argument_group("ChromaDB options")
@@ -908,6 +956,13 @@ def main():
                 import elasticsearch
             except ImportError:
                 print("Error: elasticsearch not installed. Please install with: pip install elasticsearch")
+                return
+        elif args.db_type == "milvus":
+            try:
+                import pymilvus
+            except ImportError:
+                print("Error: pymilvus not installed. Please install with: pip install pymilvus")
+                # also "pymilvus[model]"
                 return
             
         run_search(args)

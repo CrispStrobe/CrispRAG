@@ -1968,6 +1968,45 @@ class ModelUtils:
                 return False
         except:
             return False
+        
+    @staticmethod
+    def check_milvus_available(host="localhost", port="19530", verbose=False):
+        """
+        Check if Milvus is available.
+        
+        Args:
+            host: Milvus host
+            port: Milvus port
+            verbose: Whether to show verbose output
+            
+        Returns:
+            bool: Whether Milvus is available
+        """
+        try:
+            try:
+                from pymilvus import connections, utility
+                
+                # Try to connect
+                connections.connect("default", host=host, port=port)
+                
+                # Check if connection is successful by listing collections
+                utility.list_collections()
+                
+                # Disconnect
+                connections.disconnect("default")
+                
+                if verbose:
+                    print(f"✓ Milvus server available at {host}:{port}")
+                return True
+            except ImportError:
+                print("Milvus client not available. Install with: pip install pymilvus")
+                return False
+            except Exception as e:
+                if verbose:
+                    print(f"✗ Milvus server not available at {host}:{port}: {e}")
+                return False
+        except:
+            return False
 
 #######################################
 # TextExtractorUtils Class
@@ -2566,4 +2605,16 @@ class GeneralUtils:
                 return True, []
             except ImportError:
                 return False, ["elasticsearch"]
+        elif db_type.lower() == "chromadb":
+            try:
+                import chromadb
+                return True, []
+            except ImportError:
+                return False, ["chromadb"]
+        elif db_type.lower() == "milvus":
+            try:
+                import pymilvus
+                return True, []
+            except ImportError:
+                return False, ["pymilvus"]
         return True, []  # Default for unknown database types
