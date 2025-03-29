@@ -117,21 +117,6 @@ class ElasticsearchManager(VectorDBInterface):
             print(f"Error connecting to Elasticsearch: {str(e)}")
             raise
         
-    def _sanitize_field_name(self, field_name):
-        """Sanitize model name for use as a field name in Elasticsearch"""
-        # Extract just the final part of the model name if it has slashes
-        if "/" in field_name:
-            field_name = field_name.split("/")[-1]
-            
-        # Replace any non-alphanumeric characters with underscores
-        sanitized = re.sub(r'[^a-zA-Z0-9]', '_', field_name)
-        
-        # Ensure the name isn't too long
-        if len(sanitized) > 40:
-            sanitized = sanitized[:40]
-            
-        return sanitized
-        
     def create_collection(self, recreate: bool = False) -> None:
         """Create Elasticsearch index with vector search capabilities"""
         try:
@@ -266,6 +251,9 @@ class ElasticsearchManager(VectorDBInterface):
     
     def _record_hit(self, search_type: str, hit: bool):
         """Record hit for performance tracking"""
+        if not hasattr(self, '_hit_rates'):
+            self._hit_rates = {}
+            
         if search_type not in self._hit_rates:
             self._hit_rates[search_type] = {"hits": 0, "total": 0}
             
@@ -470,8 +458,9 @@ class ElasticsearchManager(VectorDBInterface):
                     # Record hit rates if ground truth is available
                     true_context = getattr(processor, 'expected_context', None)
                     if true_context:
-                        hit = any(hasattr(p, "payload") and p.payload and p.payload.get("content") == true_context 
-                                for p in reranked_results)
+                        hit = any(r.get("_source", {}).get("content") == true_context 
+                                if hasattr(r, "get") else r.payload.get("content") == true_context 
+                                for r in reranked_results)
                         search_key = f"hybrid_{fusion_type}"
                         if rerank:
                             search_key += f"_{reranker_type or 'default'}"
@@ -482,8 +471,9 @@ class ElasticsearchManager(VectorDBInterface):
                 # Record hit rates if ground truth is available
                 true_context = getattr(processor, 'expected_context', None)
                 if true_context:
-                    hit = any(hasattr(p, "payload") and p.payload and p.payload.get("content") == true_context 
-                            for p in fused_results)
+                    hit = any(r.get("_source", {}).get("content") == true_context 
+                            if hasattr(r, "get") else r.payload.get("content") == true_context 
+                            for r in fused_results)
                     search_key = f"hybrid_{fusion_type}"
                     self._record_hit(search_key, hit)
                 
@@ -498,6 +488,8 @@ class ElasticsearchManager(VectorDBInterface):
                 import traceback
                 traceback.print_exc()
             return {"error": f"Error in hybrid search: {str(e)}"}
+
+
     
     def search(self, query: str, search_type: str = "hybrid", limit: int = 10,
               processor: Any = None, prefetch_limit: int = 50, fusion_type: str = "rrf",
@@ -568,21 +560,27 @@ class ElasticsearchManager(VectorDBInterface):
             import traceback
             traceback.print_exc()
             return {"error": str(e)}
-    
-    def _adapt_elasticsearch_result(self, hit):
-        """Adapt Elasticsearch hit to the expected result format"""
-        class Point:
-            def __init__(self, id, payload, score):
-                self.id = id
-                self.payload = payload
-                self.score = score
         
+    def _adapt_elasticsearch_result_to_point(self, hit):
+        """
+        Adapt Elasticsearch hit to the expected result format.
+        Instead of returning a custom Point object, return a dictionary
+        that's directly compatible with ResultProcessor.adapt_result().
+        
+        Args:
+            hit: Elasticsearch hit result
+            
+        Returns:
+            Dictionary with _id, _source, and _score keys
+        """
         # Extract source data
         source = hit.get("_source", {})
         
         # Build payload with all necessary fields
         payload = {
-            "content": source.get("content", ""),
+            # Ensure both "text" and "content" fields are present
+            "text": source.get("content", source.get("text", "")),
+            "content": source.get("content", source.get("text", "")),
             "file_path": source.get("file_path", ""),
             "file_name": source.get("file_name", ""),
             "chunk_index": source.get("chunk_index", 0),
@@ -595,14 +593,20 @@ class ElasticsearchManager(VectorDBInterface):
         
         # Extract score, normalizing to [0, 1] range
         raw_score = hit.get("_score", 0)
-        normalized_score = min(1.0, max(0.0, raw_score / 10.0))  # Simple normalization, adjust as needed
+        normalized_score = min(1.0, max(0.0, raw_score / 10.0))  # Simple normalization
         
-        return Point(hit.get("_id", ""), payload, normalized_score)
+        # Return a dictionary directly instead of a Point object
+        # This format matches what ResultProcessor.adapt_result expects
+        return {
+            "_id": hit.get("_id", ""),
+            "_source": payload,
+            "_score": normalized_score
+        }
     
     def search_dense(self, query: str, processor: Any, limit: int, score_threshold: float = None,
                     rerank: bool = False, reranker_type: str = None):
         """
-        Perform dense vector search in Elasticsearch.
+        Perform dense vector search in Elasticsearch using vectors directly.
         
         Args:
             query: Search query string
@@ -622,35 +626,84 @@ class ElasticsearchManager(VectorDBInterface):
             # Generate query embedding
             query_vector = processor.get_embedding(query)
             
-            # Build search query
-            search_query = {
-                "knn": {
-                    self.dense_field: {
-                        "vector": query_vector.tolist(),
-                        "k": limit * 3  # Fetch more for filtering
-                    }
-                }
-            }
-            
-            # Execute search
-            results = self.client.search(
-                index=self.collection_name,
-                query=search_query,
-                size=limit * 3
-            )
-            
-            # Extract hits
-            hits = results.get("hits", {}).get("hits", [])
+            # Get model ID from processor to construct the correct field name
+            dense_model_id = processor.dense_model_id if hasattr(processor, 'dense_model_id') else self.dense_model_id
+            # Get the precise field name based on the model ID - don't sanitize again
+            vector_field = f"vector_{dense_model_id.replace('-', '_')}"
             
             if self.verbose:
-                print(f"Dense search returned {len(hits)} results")
+                print(f"Using vector field: {vector_field}")
             
-            # Convert to point objects
-            points = [self._adapt_elasticsearch_result(hit) for hit in hits]
+            # First try: Use _knn_search endpoint which works directly on the field name
+            try:
+                # Construct search using knn top-level parameter
+                search_body = {
+                    "knn": {
+                        "field": vector_field,
+                        "query_vector": query_vector.tolist(),
+                        "k": limit * 3,
+                        "num_candidates": 100
+                    }
+                }
+                
+                # Execute search
+                results = self.client.search(
+                    index=self.collection_name,
+                    body=search_body,
+                    size=limit * 3
+                )
+                
+                # Extract hits
+                hits = results.get("hits", {}).get("hits", [])
+                
+                if self.verbose:
+                    print(f"Vector search returned {len(hits)} results using knn search")
+                    
+            except Exception as knn_error:
+                if self.verbose:
+                    print(f"KNN search failed: {knn_error}")
+                    print("Falling back to script_score approach")
+                    
+                # Try script_score approach which is more broadly compatible
+                try:
+                    # Build script score query to calculate cosine similarity
+                    script_query = {
+                        "script_score": {
+                            "query": {"match_all": {}},
+                            "script": {
+                                "source": f"cosineSimilarity(params.query_vector, doc['{vector_field}']) + 1.0",
+                                "params": {
+                                    "query_vector": query_vector.tolist()
+                                }
+                            }
+                        }
+                    }
+                    
+                    # Execute search
+                    results = self.client.search(
+                        index=self.collection_name,
+                        query=script_query,
+                        size=limit * 3
+                    )
+                    
+                    # Extract hits
+                    hits = results.get("hits", {}).get("hits", [])
+                    
+                    if self.verbose:
+                        print(f"Vector search returned {len(hits)} results using script_score")
+                        
+                except Exception as script_error:
+                    if self.verbose:
+                        print(f"Script score search failed: {script_error}")
+                        print("Falling back to keyword search")
+                    return self.search_keyword(query, limit, score_threshold, rerank, reranker_type)
+            
+            # Convert to dictionary format that's compatible with ResultProcessor.adapt_result
+            points = [self._adapt_elasticsearch_result_to_point(hit) for hit in hits]
             
             # Apply score threshold if provided
             if score_threshold is not None:
-                points = [p for p in points if p.score >= score_threshold]
+                points = [p for p in points if p.get("_score", 0) >= score_threshold]
             
             # Apply reranking if requested
             if rerank and len(points) > 0:
@@ -661,7 +714,7 @@ class ElasticsearchManager(VectorDBInterface):
                 # Record hit rates if ground truth is available
                 true_context = getattr(processor, 'expected_context', None)
                 if true_context:
-                    hit = any(p.payload.get("content") == true_context for p in reranked_points)
+                    hit = any(p.get("_source", {}).get("content") == true_context for p in reranked_points)
                     search_key = "vector"
                     if rerank:
                         search_key += f"_{reranker_type or 'default'}"
@@ -672,7 +725,7 @@ class ElasticsearchManager(VectorDBInterface):
             # Record hit rates if ground truth is available
             true_context = getattr(processor, 'expected_context', None)
             if true_context:
-                hit = any(p.payload.get("content") == true_context for p in points)
+                hit = any(p.get("_source", {}).get("content") == true_context for p in points)
                 self._record_hit("vector", hit)
             
             return points[:limit]
@@ -680,15 +733,33 @@ class ElasticsearchManager(VectorDBInterface):
         except Exception as e:
             if self.verbose:
                 print(f"Error in dense search: {e}")
+                import traceback
+                traceback.print_exc()
             return {"error": f"Error in dense search: {str(e)}"}
-    
+
+    def _sanitize_field_name(self, field_name):
+        """Sanitize model name for use as a field name in Elasticsearch"""
+        # Extract just the final part of the model name if it has slashes
+        if "/" in field_name:
+            field_name = field_name.split("/")[-1]
+            
+        # Replace any non-alphanumeric characters with underscores
+        sanitized = re.sub(r'[^a-zA-Z0-9]', '_', field_name)
+        
+        # Ensure the name isn't too long
+        if len(sanitized) > 40:
+            sanitized = sanitized[:40]
+            
+        return sanitized
+
+        
     def search_sparse(self, query: str, processor: Any, limit: int, score_threshold: float = None,
                     rerank: bool = False, reranker_type: str = None):
         """
         Perform sparse vector search.
         
         Elasticsearch doesn't have direct support for sparse vectors like Qdrant or Milvus,
-        so we use the stored sparse vector components to calculate scores.
+        so we use the stored sparse vector components to calculate scores or fall back to keyword search.
         
         Args:
             query: Search query string
@@ -716,7 +787,20 @@ class ElasticsearchManager(VectorDBInterface):
             if self.verbose:
                 print("Sparse search not directly supported in Elasticsearch, falling back to keyword search")
             
-            return self.search_keyword(query, limit, score_threshold, rerank, reranker_type)
+            # Get keyword search results, but adapt them properly
+            keyword_results = self.search_keyword(query, limit, score_threshold, rerank, reranker_type)
+            
+            # Check if we got an error
+            if isinstance(keyword_results, dict) and "error" in keyword_results:
+                return keyword_results
+                
+            # Record hit rates if ground truth is available
+            true_context = getattr(processor, 'expected_context', None)
+            if true_context:
+                hit = any(p.get("_source", {}).get("content") == true_context for p in keyword_results)
+                self._record_hit("sparse", hit)
+                
+            return keyword_results
             
         except Exception as e:
             if self.verbose:
@@ -724,7 +808,7 @@ class ElasticsearchManager(VectorDBInterface):
             return {"error": f"Error in sparse search: {str(e)}"}
     
     def search_keyword(self, query: str, limit: int = 10, score_threshold: float = None,
-                      rerank: bool = False, reranker_type: str = None):
+                        rerank: bool = False, reranker_type: str = None):
         """
         Perform a keyword-based search.
         
@@ -767,20 +851,38 @@ class ElasticsearchManager(VectorDBInterface):
             if self.verbose:
                 print(f"Keyword search returned {len(hits)} results")
             
-            # Convert to point objects
-            points = [self._adapt_elasticsearch_result(hit) for hit in hits]
+            # Convert to dictionary format that's compatible with ResultProcessor.adapt_result
+            points = [self._adapt_elasticsearch_result_to_point(hit) for hit in hits]
             
             # Apply score threshold if provided
             if score_threshold is not None:
-                points = [p for p in points if p.score >= score_threshold]
+                points = [p for p in points if p.get("_score", 0) >= score_threshold]
             
-            # Apply reranking if requested - but this requires a processor
+            # Apply reranking if requested and processor is provided
             if rerank and len(points) > 0 and 'processor' in locals() and locals()['processor'] is not None:
                 processor = locals()['processor']
                 reranked_points = SearchAlgorithms.rerank_results(
                     query, points, processor, limit, self.verbose
                 )
+                
+                # Record hit rates if ground truth is available
+                true_context = getattr(processor, 'expected_context', None)
+                if true_context:
+                    hit = any(p.get("_source", {}).get("content") == true_context for p in reranked_points)
+                    search_key = "keyword"
+                    if rerank:
+                        search_key += f"_{reranker_type or 'default'}"
+                    self._record_hit(search_key, hit)
+                    
                 return reranked_points[:limit]
+            
+            # Record hit rates if ground truth is available and processor is provided
+            if 'processor' in locals() and locals()['processor'] is not None:
+                processor = locals()['processor']
+                true_context = getattr(processor, 'expected_context', None)
+                if true_context:
+                    hit = any(p.get("_source", {}).get("content") == true_context for p in points)
+                    self._record_hit("keyword", hit)
             
             return points[:limit]
             
@@ -788,6 +890,7 @@ class ElasticsearchManager(VectorDBInterface):
             if self.verbose:
                 print(f"Error in keyword search: {e}")
             return {"error": f"Error in keyword search: {str(e)}"}
+
     
     def _retrieve_context_for_chunk(self, file_path: str, chunk_index: int, window: int = 1) -> str:
         """
@@ -809,7 +912,7 @@ class ElasticsearchManager(VectorDBInterface):
             min_idx = max(0, chunk_index - window)
             max_idx = chunk_index + window
             
-            # Build search query for parent_id or file_path and chunk_index in range
+            # Build search query for file_path and chunk_index in range
             search_query = {
                 "bool": {
                     "must": [
@@ -837,7 +940,8 @@ class ElasticsearchManager(VectorDBInterface):
             chunks = []
             for hit in hits:
                 source = hit.get("_source", {})
-                content = source.get("content", "")
+                # Get content from the appropriate field
+                content = source.get("content", source.get("text", ""))
                 chunks.append(content)
             
             # Combine the content

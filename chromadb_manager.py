@@ -493,7 +493,8 @@ class ChromaDBManager(VectorDBInterface):
                     score_threshold: float = None, rerank: bool = False,
                     reranker_type: str = None):
         """
-        Perform hybrid search combining dense and sparse search results.
+        Perform improved hybrid search combining dense and keyword search results
+        with query term relevance enhancements.
         
         Args:
             query: Search query string
@@ -509,51 +510,56 @@ class ChromaDBManager(VectorDBInterface):
             List of search results
         """
         if not self.use_embedding_function and processor is None:
-            return {"error": "Hybrid search requires an embedding model or ChromaDB embedding function"}
+            return {"error": "Hybrid search requires an embedding model or embedding function"}
         
         try:
-            # Get more results than needed for fusion
-            fetch_limit = prefetch_limit
+            # Get more results than needed for filtering, fusion, and reranking
+            fetch_limit = max(100, prefetch_limit * 2)
             
             if self.verbose:
                 print(f"Executing hybrid search for query: '{query}'")
                 print(f"Using fusion type: {fusion_type}")
             
-            # Step 1: Get dense search results
+            # Step 1: Get vector/dense search results
             if self.use_embedding_function:
-                # When using embedding function, there's no difference between vector and keyword search
-                # in the API call, so we'll get both results the same way
+                # When using embedding function, use query_texts
                 dense_results = self.collection.query(
-                    query_texts=[query],
-                    n_results=fetch_limit,
-                    include=["documents", "metadatas", "distances"]
-                )
-                
-                keyword_results = self.collection.query(
                     query_texts=[query],
                     n_results=fetch_limit,
                     include=["documents", "metadatas", "distances"]
                 )
             else:
-                # Generate query embedding
+                # Generate query embedding and use it
                 query_vector = processor.get_embedding(query)
                 
-                # Step 1: Get dense search results with query vector
                 dense_results = self.collection.query(
                     query_embeddings=[query_vector.tolist()],
                     n_results=fetch_limit,
                     include=["documents", "metadatas", "distances"]
                 )
-                
-                # Step 2: Get keyword search results with query text
-                keyword_results = self.collection.query(
-                    query_texts=[query],
-                    n_results=fetch_limit,
-                    include=["documents", "metadatas", "distances"]
-                )
             
-            # Process dense results
+            # Step 2: Get keyword search results
+            keyword_results = self.collection.query(
+                query_texts=[query],
+                n_results=fetch_limit,
+                include=["documents", "metadatas", "distances"]
+            )
+            
+            # Extract query terms for relevance enhancement
+            query_terms = [term.lower() for term in query.split() if len(term) > 2]
+            query_lower = query.lower()
+            
+            # Initialize adapter class
+            class ChromaDBPoint:
+                def __init__(self, id, payload, score):
+                    self.id = id
+                    self.payload = payload
+                    self.score = score
+            
+            # Process dense results with improved relevance
             dense_points = []
+            dense_doc_ids = set()  # Track to avoid duplicates
+            
             if dense_results['ids'][0]:
                 for i in range(len(dense_results['ids'][0])):
                     doc_id = dense_results['ids'][0][i]
@@ -561,33 +567,78 @@ class ChromaDBManager(VectorDBInterface):
                     metadata = dense_results['metadatas'][0][i]
                     distance = dense_results['distances'][0][i]
                     
-                    # Convert distance to score (ChromaDB returns L2 distance, lower is better)
-                    score = 1.0 / (1.0 + distance)
+                    # Skip if we've already processed this document
+                    if doc_id in dense_doc_ids:
+                        continue
+                    dense_doc_ids.add(doc_id)
                     
-                    # Build result object
-                    result = {
-                        "id": doc_id,
-                        "text": document,
-                        "score": score
-                    }
+                    # Basic vector score (convert distance to 0-1 score)
+                    vector_score = 1.0 / (1.0 + distance)
                     
-                    # Add metadata fields
+                    # Check document for query terms
+                    document_lower = document.lower()
+                    
+                    # Relevance enhancement
+                    relevance_score = vector_score
+                    
+                    # Exact query match
+                    if query_lower in document_lower:
+                        relevance_score = max(0.9, relevance_score)  # At least 0.9
+                        relevance_score = min(1.0, relevance_score + 0.1)  # Add a boost, cap at 1.0
+                    # Partial term matches
+                    elif query_terms:
+                        matched_terms = [t for t in query_terms if t in document_lower]
+                        if matched_terms:
+                            term_ratio = len(matched_terms) / len(query_terms)
+                            term_boost = term_ratio * 0.3  # Up to 0.3 boost from terms
+                            relevance_score = vector_score * 0.7 + term_boost  # 70% vector, 30% terms
+                    
+                    # Process metadata
+                    processed_metadata = {}
+                    chunk_index = 0
+                    file_path = ""
+                    file_name = ""
+                    
                     for key, value in metadata.items():
-                        if key not in ['sparse_indices', 'sparse_values']:
-                            result[key] = value
+                        if key == "chunk_index":
+                            if isinstance(value, str):
+                                try:
+                                    chunk_index = int(value)
+                                except ValueError:
+                                    chunk_index = 0
+                            else:
+                                chunk_index = value
+                        elif key == "file_path":
+                            file_path = value
+                        elif key == "file_name":
+                            file_name = value
+                        elif key not in ['sparse_indices', 'sparse_values']:
+                            processed_metadata[key] = value
                     
-                    # Add payload for compatibility
-                    result["payload"] = {
+                    # Create payload
+                    payload = {
                         "id": doc_id,
                         "text": document,
-                        "score": score,
-                        **{k: v for k, v in metadata.items() if k not in ['sparse_indices', 'sparse_values']}
+                        "score": relevance_score,
+                        "chunk_index": chunk_index,
+                        "file_path": file_path,
+                        "file_name": file_name,
+                        "metadata": {
+                            "dense_embedder": self.dense_model_id,
+                            "sparse_embedder": self.sparse_model_id,
+                            "search_type": "vector",
+                            **processed_metadata
+                        }
                     }
                     
-                    dense_points.append(result)
+                    # Create and add the point
+                    point = ChromaDBPoint(doc_id, payload, relevance_score)
+                    dense_points.append(point)
             
-            # Process keyword results
+            # Process keyword results with improved relevance
             keyword_points = []
+            keyword_doc_ids = set()  # Track to avoid duplicates
+            
             if keyword_results['ids'][0]:
                 for i in range(len(keyword_results['ids'][0])):
                     doc_id = keyword_results['ids'][0][i]
@@ -595,45 +646,132 @@ class ChromaDBManager(VectorDBInterface):
                     metadata = keyword_results['metadatas'][0][i]
                     distance = keyword_results['distances'][0][i]
                     
-                    # Convert distance to score (ChromaDB returns L2 distance, lower is better)
-                    score = 1.0 / (1.0 + distance)
+                    # Skip if we've already processed this document
+                    if doc_id in keyword_doc_ids:
+                        continue
+                    keyword_doc_ids.add(doc_id)
                     
-                    # Build result object
-                    result = {
-                        "id": doc_id,
-                        "text": document,
-                        "score": score
-                    }
+                    # Calculate keyword score
+                    document_lower = document.lower()
                     
-                    # Add metadata fields
+                    # Relevance calculation for keyword results
+                    # Basic score from ChromaDB distance
+                    keyword_score = 1.0 / (1.0 + distance)
+                    
+                    # Relevance enhancement based on term matching
+                    if query_lower in document_lower:
+                        # Exact query match
+                        keyword_score = max(0.9, keyword_score)  # At least 0.9
+                    elif query_terms:
+                        matched_terms = [t for t in query_terms if t in document_lower]
+                        if matched_terms:
+                            term_ratio = len(matched_terms) / len(query_terms)
+                            keyword_score = max(keyword_score, term_ratio * 0.9)  # Up to 0.9 for all terms
+                    
+                    # Process metadata
+                    processed_metadata = {}
+                    chunk_index = 0
+                    file_path = ""
+                    file_name = ""
+                    
                     for key, value in metadata.items():
-                        if key not in ['sparse_indices', 'sparse_values']:
-                            result[key] = value
+                        if key == "chunk_index":
+                            if isinstance(value, str):
+                                try:
+                                    chunk_index = int(value)
+                                except ValueError:
+                                    chunk_index = 0
+                            else:
+                                chunk_index = value
+                        elif key == "file_path":
+                            file_path = value
+                        elif key == "file_name":
+                            file_name = value
+                        elif key not in ['sparse_indices', 'sparse_values']:
+                            processed_metadata[key] = value
                     
-                    # Add payload for compatibility
-                    result["payload"] = {
+                    # Create payload
+                    payload = {
                         "id": doc_id,
                         "text": document,
-                        "score": score,
-                        **{k: v for k, v in metadata.items() if k not in ['sparse_indices', 'sparse_values']}
+                        "score": keyword_score,
+                        "chunk_index": chunk_index,
+                        "file_path": file_path,
+                        "file_name": file_name,
+                        "metadata": {
+                            "dense_embedder": self.dense_model_id,
+                            "sparse_embedder": self.sparse_model_id,
+                            "search_type": "keyword",
+                            **processed_metadata
+                        }
                     }
                     
-                    keyword_points.append(result)
+                    # Create and add the point
+                    point = ChromaDBPoint(doc_id, payload, keyword_score)
+                    keyword_points.append(point)
             
             if self.verbose:
                 print(f"Dense search returned {len(dense_points)} results")
                 print(f"Keyword search returned {len(keyword_points)} results")
             
-            # Apply fusion to combine results
-            combined_points = SearchAlgorithms.manual_fusion(
-                dense_points, 
-                keyword_points, 
-                fetch_limit, 
-                fusion_type
-            )
+            # Apply score threshold if provided
+            if score_threshold is not None:
+                dense_points = [p for p in dense_points if p.score >= score_threshold]
+                keyword_points = [p for p in keyword_points if p.score >= score_threshold]
+            
+            # Categorize results for custom fusion
+            exact_match_points = []
+            term_match_points = []
+            semantic_points = []
+            
+            # Combined document ID tracking for deduplication
+            all_doc_ids = set()
+            
+            # 1. First pass: identify exact matches across all results
+            for points_list in [dense_points, keyword_points]:
+                for point in points_list:
+                    if point.id in all_doc_ids:
+                        continue
+                    
+                    document_lower = point.payload["text"].lower()
+                    
+                    if query_lower in document_lower:
+                        exact_match_points.append(point)
+                        all_doc_ids.add(point.id)
+            
+            # 2. Second pass: identify term matches
+            for points_list in [dense_points, keyword_points]:
+                for point in points_list:
+                    if point.id in all_doc_ids:
+                        continue
+                    
+                    document_lower = point.payload["text"].lower()
+                    matched_terms = [t for t in query_terms if t in document_lower]
+                    
+                    if matched_terms:
+                        term_match_points.append(point)
+                        all_doc_ids.add(point.id)
+            
+            # 3. Third pass: remaining semantic matches
+            for points_list in [dense_points, keyword_points]:
+                for point in points_list:
+                    if point.id not in all_doc_ids:
+                        semantic_points.append(point)
+                        all_doc_ids.add(point.id)
+            
+            # Sort each category by score
+            exact_match_points.sort(key=lambda p: p.score, reverse=True)
+            term_match_points.sort(key=lambda p: p.score, reverse=True)
+            semantic_points.sort(key=lambda p: p.score, reverse=True)
+            
+            # Combine in order of relevance
+            combined_points = exact_match_points + term_match_points + semantic_points
             
             if self.verbose:
                 print(f"Combined hybrid search returned {len(combined_points)} results")
+                print(f"   - Exact matches: {len(exact_match_points)}")
+                print(f"   - Term matches: {len(term_match_points)}")
+                print(f"   - Semantic matches: {len(semantic_points)}")
             
             # Apply reranking if requested
             if rerank and combined_points and processor:
@@ -648,6 +786,7 @@ class ChromaDBManager(VectorDBInterface):
                 hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in combined_points)
                 self._record_hit("hybrid", hit)
             
+            # Return the requested number of results
             return combined_points[:limit]
             
         except Exception as e:
@@ -659,7 +798,7 @@ class ChromaDBManager(VectorDBInterface):
     def search_sparse(self, query: str, processor: Any, limit: int, score_threshold: float = None,
                     rerank: bool = False, reranker_type: str = None):
         """
-        Perform sparse vector search in ChromaDB.
+        Perform sparse vector search in ChromaDB with improved relevance scoring.
         ChromaDB doesn't natively support sparse vectors, so we simulate it using metadata.
         
         Args:
@@ -680,18 +819,22 @@ class ChromaDBManager(VectorDBInterface):
             if self.verbose:
                 print(f"Executing sparse search for query: '{query}'")
             
-            # Generate sparse vector for query
+            # Get sparse vector for query
             if not self.use_embedding_function:
                 sparse_indices, sparse_values = processor.get_sparse_embedding(query)
                 
                 if self.verbose:
                     print(f"Generated sparse vector with {len(sparse_indices)} dimensions")
             
+            # Extract query terms for relevance enhancement
+            query_terms = [term.lower() for term in query.split() if len(term) > 2]
+            query_lower = query.lower()
+            
             # Since ChromaDB doesn't support sparse vectors natively,
             # we'll do a full-text search first, then re-rank based on sparse vector similarity
             
             # Get more results than needed
-            fetch_limit = limit * 5
+            fetch_limit = max(100, limit * 5)
             
             # First, do a full-text search to get candidates
             results = self.collection.query(
@@ -706,18 +849,41 @@ class ChromaDBManager(VectorDBInterface):
                     print("No results found for full-text search")
                 return []
             
-            # Extract and re-score results based on sparse vector similarity
-            points = []
+            # Initialize adapter class
+            class ChromaDBPoint:
+                def __init__(self, id, payload, score):
+                    self.id = id
+                    self.payload = payload
+                    self.score = score
             
+            # Categories for sorting results
+            exact_matches = []
+            term_matches = []
+            sparse_matches = []
+            
+            # Extract and re-score results based on sparse vector similarity and term presence
             for i in range(len(results['ids'][0])):
                 doc_id = results['ids'][0][i]
                 document = results['documents'][0][i]
                 metadata = results['metadatas'][0][i]
+                distance = results['distances'][0][i]
                 
-                # Check if document has sparse vector info in metadata
-                if 'sparse_indices' in metadata and 'sparse_values' in metadata:
-                    # Extract sparse vector from metadata
+                # Calculate basic score from distance
+                base_score = 1.0 / (1.0 + distance)
+                document_lower = document.lower()
+                
+                # Check for query terms in document
+                has_exact_match = query_lower in document_lower
+                matched_terms = [t for t in query_terms if t in document_lower]
+                term_ratio = len(matched_terms) / len(query_terms) if query_terms else 0
+                
+                # Calculate sparse similarity (dot product) if available
+                sparse_score = 0.0
+                has_sparse_vector = False
+                
+                if not self.use_embedding_function and 'sparse_indices' in metadata and 'sparse_values' in metadata:
                     try:
+                        # Extract sparse vector from metadata
                         # Handle JSON-encoded sparse vectors
                         if isinstance(metadata['sparse_indices'], str) and metadata['sparse_indices'].startswith('['):
                             doc_sparse_indices = json.loads(metadata['sparse_indices'])
@@ -728,62 +894,101 @@ class ChromaDBManager(VectorDBInterface):
                             doc_sparse_values = [float(val) for val in metadata['sparse_values']]
                         
                         # Calculate sparse similarity (dot product)
-                        # Only if not using embedding function
-                        if not self.use_embedding_function:
-                            similarity = 0.0
-                            query_sparse_dict = {idx: val for idx, val in zip(sparse_indices, sparse_values)}
-                            for idx, val in zip(doc_sparse_indices, doc_sparse_values):
-                                if idx in query_sparse_dict:
-                                    similarity += val * query_sparse_dict[idx]
-                            
-                            # Normalize similarity score to 0-1 range
-                            score = min(1.0, similarity)
-                        else:
-                            # When using embedding function, we'll just use the distance-based score
-                            distance = results['distances'][0][i]
-                            score = 1.0 / (1.0 + distance)  # Convert distance to score
+                        query_sparse_dict = {idx: val for idx, val in zip(sparse_indices, sparse_values)}
+                        for idx, val in zip(doc_sparse_indices, doc_sparse_values):
+                            if idx in query_sparse_dict:
+                                sparse_score += val * query_sparse_dict[idx]
+                        
+                        # Normalize similarity score to 0-1 range
+                        sparse_score = min(1.0, sparse_score)
+                        has_sparse_vector = True
                     except Exception as e:
                         if self.verbose:
                             print(f"Error processing sparse vector for document {doc_id}: {e}")
-                        # Fallback score
-                        distance = results['distances'][0][i]
-                        score = 1.0 / (1.0 + distance)  # Convert distance to score
+                
+                # Calculate final relevance score with proper weighting
+                if has_exact_match:
+                    # Exact match gets highest priority
+                    relevance_score = 0.8 + (0.2 * max(sparse_score, base_score))
+                elif term_ratio > 0:
+                    # Term matches get term ratio weight plus sparse/base contribution
+                    term_component = term_ratio * 0.5  # Up to 0.5 for terms
+                    vector_component = max(sparse_score, base_score) * 0.5  # Up to 0.5 for vector match
+                    relevance_score = term_component + vector_component
+                elif has_sparse_vector:
+                    # Sparse vector match without term match
+                    relevance_score = sparse_score * 0.7  # Lower weight without term matches
                 else:
-                    # If document doesn't have sparse vector info, use the distance-based score
-                    distance = results['distances'][0][i]
-                    score = 1.0 / (1.0 + distance)  # Convert distance to score
+                    # Fall back to base score with lower weight
+                    relevance_score = base_score * 0.5
                 
-                # Apply score threshold if provided
-                if score_threshold is not None and score < score_threshold:
-                    continue
+                # Process metadata
+                processed_metadata = {}
+                chunk_index = 0
+                file_path = ""
+                file_name = ""
                 
-                # Build result object
-                result = {
-                    "id": doc_id,
-                    "text": document,
-                    "score": score
-                }
-                
-                # Add metadata fields, skipping large sparse vector data
                 for key, value in metadata.items():
-                    if key not in ['sparse_indices', 'sparse_values']:
-                        result[key] = value
+                    if key == "chunk_index":
+                        # Extract and convert chunk_index
+                        if isinstance(value, str):
+                            try:
+                                chunk_index = int(value)
+                            except ValueError:
+                                chunk_index = 0
+                        else:
+                            chunk_index = value
+                    elif key == "file_path":
+                        file_path = value
+                    elif key == "file_name":
+                        file_name = value
+                    elif key not in ['sparse_indices', 'sparse_values']:
+                        # Skip sparse vector data, add all other metadata
+                        processed_metadata[key] = value
                 
-                # Add payload for compatibility
-                result["payload"] = {
+                # Create a properly structured payload with metadata in the expected format
+                payload = {
                     "id": doc_id,
                     "text": document,
-                    "score": score,
-                    **{k: v for k, v in metadata.items() if k not in ['sparse_indices', 'sparse_values']}
+                    "score": relevance_score,
+                    "chunk_index": chunk_index,
+                    "file_path": file_path,
+                    "file_name": file_name,
+                    # Add a proper metadata dict with embedder info
+                    "metadata": {
+                        "dense_embedder": self.dense_model_id,
+                        "sparse_embedder": self.sparse_model_id,
+                        **processed_metadata
+                    }
                 }
                 
-                points.append(result)
+                # Create and categorize the point
+                point = ChromaDBPoint(doc_id, payload, relevance_score)
+                
+                if has_exact_match:
+                    exact_matches.append(point)
+                elif term_ratio > 0:
+                    term_matches.append(point)
+                else:
+                    sparse_matches.append(point)
             
-            # Sort by score (descending)
-            points.sort(key=lambda x: x["score"], reverse=True)
+            # Sort each category by score
+            exact_matches.sort(key=lambda p: p.score, reverse=True)
+            term_matches.sort(key=lambda p: p.score, reverse=True)
+            sparse_matches.sort(key=lambda p: p.score, reverse=True)
+            
+            # Combine categories, prioritizing exact matches
+            points = exact_matches + term_matches + sparse_matches
+            
+            # Apply score threshold if provided
+            if score_threshold is not None:
+                points = [p for p in points if p.score >= score_threshold]
             
             if self.verbose:
                 print(f"Sparse search returned {len(points)} results")
+                print(f"   - Exact query matches: {len(exact_matches)}")
+                print(f"   - Term matches: {len(term_matches)}")
+                print(f"   - Sparse-only matches: {len(sparse_matches)}")
             
             # Apply reranking if requested
             if rerank and points and processor:
