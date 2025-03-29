@@ -33,7 +33,9 @@ class ChromaDBManager(VectorDBInterface):
                 storage_path: str = None,
                 verbose: bool = False,
                 dense_model_id: str = "bge-small",
-                sparse_model_id: str = "distilbert-splade"):
+                sparse_model_id: str = "distilbert-splade",
+                use_embedding_function: bool = False,
+                embedding_function_model: str = "sentence-transformers/all-MiniLM-L6-v2"):
         """
         Initialize ChromaDBManager with model-specific vector configuration.
         
@@ -46,6 +48,8 @@ class ChromaDBManager(VectorDBInterface):
             verbose: Verbose output
             dense_model_id: ID of dense model for naming vectors
             sparse_model_id: ID of sparse model for naming vectors
+            use_embedding_function: Whether to use ChromaDB's built-in embedding functions
+            embedding_function_model: Model to use with ChromaDB's embedding function (if enabled)
         """
         if not chromadb_available:
             raise ImportError("ChromaDB client not available. Install with: pip install chromadb")
@@ -64,10 +68,75 @@ class ChromaDBManager(VectorDBInterface):
         self.dense_model_id = dense_model_id
         self.sparse_model_id = sparse_model_id
         
+        # Embedding function configuration
+        self.use_embedding_function = use_embedding_function
+        self.embedding_function_model = embedding_function_model
+        self.embedding_function = None
+        
         # Performance tracking
         self._hit_rates = {}
         
         self.connect()
+
+    def _initialize_embedding_function(self):
+        """Initialize the embedding function if enabled"""
+        if not self.use_embedding_function:
+            return None
+            
+        try:
+            if self.verbose:
+                print(f"Initializing ChromaDB embedding function with model: {self.embedding_function_model}")
+                
+            # Try to use the appropriate embedding function based on the model name
+            if "sentence-transformers" in self.embedding_function_model or "all-MiniLM" in self.embedding_function_model:
+                # Use the default sentence transformer embedding function
+                from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+                self.embedding_function = SentenceTransformerEmbeddingFunction(model_name=self.embedding_function_model)
+                if self.verbose:
+                    print("Using SentenceTransformerEmbeddingFunction")
+                    
+            elif "openai" in self.embedding_function_model.lower():
+                # Use OpenAI embedding function if API key is available
+                from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+                openai_api_key = os.environ.get("OPENAI_API_KEY")
+                if not openai_api_key:
+                    raise ValueError("OpenAI API key not found in environment variables")
+                self.embedding_function = OpenAIEmbeddingFunction(
+                    api_key=openai_api_key,
+                    model_name=self.embedding_function_model
+                )
+                if self.verbose:
+                    print("Using OpenAIEmbeddingFunction")
+                    
+            elif "cohere" in self.embedding_function_model.lower():
+                # Use Cohere embedding function if API key is available
+                from chromadb.utils.embedding_functions import CohereEmbeddingFunction
+                cohere_api_key = os.environ.get("COHERE_API_KEY")
+                if not cohere_api_key:
+                    raise ValueError("Cohere API key not found in environment variables")
+                self.embedding_function = CohereEmbeddingFunction(
+                    api_key=cohere_api_key,
+                    model_name=self.embedding_function_model
+                )
+                if self.verbose:
+                    print("Using CohereEmbeddingFunction")
+                    
+            else:
+                # Default to sentence transformer for any other model
+                from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+                self.embedding_function = SentenceTransformerEmbeddingFunction(model_name=self.embedding_function_model)
+                if self.verbose:
+                    print("Using default SentenceTransformerEmbeddingFunction")
+                    
+            return self.embedding_function
+            
+        except Exception as e:
+            if self.verbose:
+                print(f"Error initializing embedding function: {e}")
+                print("Falling back to manual embeddings")
+            self.use_embedding_function = False
+            self.embedding_function = None
+            return None
 
     def connect(self) -> None:
         """Connect to ChromaDB using either remote or local mode"""
@@ -134,29 +203,64 @@ class ChromaDBManager(VectorDBInterface):
                 self.client.delete_collection(name=self.collection_name)
                 exists = False
             
+            # Initialize embedding function if enabled
+            embedding_function = self._initialize_embedding_function() if self.use_embedding_function else None
+            
             # Create collection if it doesn't exist
             if not exists:
                 if self.verbose:
                     print(f"Creating collection '{self.collection_name}'")
                 
                 # Create the metadata to store model information
+                # Ensure there are no None values in metadata - ChromaDB doesn't accept them
                 metadata = {
-                    "vector_size": self.vector_dim,
-                    "dense_model_id": self.dense_model_id,
-                    "sparse_model_id": self.sparse_model_id
+                    "vector_size": str(self.vector_dim),  # Convert to string to avoid potential issues
+                    "dense_model_id": self.dense_model_id if self.dense_model_id else "unknown",
+                    "sparse_model_id": self.sparse_model_id if self.sparse_model_id else "unknown"
                 }
                 
-                # Create the collection (ChromaDB handles vector dimensions automatically)
-                self.collection = self.client.create_collection(
-                    name=self.collection_name,
-                    metadata=metadata
-                )
+                # Only add embedding function info if it's enabled and exists
+                if self.use_embedding_function:
+                    metadata["uses_embedding_function"] = "true"  # Use string instead of boolean
+                    if self.embedding_function_model:
+                        metadata["embedding_function_model"] = self.embedding_function_model
+                
+                # Remove any None values that might still be in metadata
+                metadata = {k: v for k, v in metadata.items() if v is not None}
+                
+                if self.verbose:
+                    print(f"Creating collection with metadata: {metadata}")
+                
+                # Create the collection with or without embedding function
+                if self.use_embedding_function and embedding_function is not None:
+                    self.collection = self.client.create_collection(
+                        name=self.collection_name,
+                        metadata=metadata,
+                        embedding_function=embedding_function
+                    )
+                    if self.verbose:
+                        print(f"Collection created with embedding function: {self.embedding_function_model}")
+                else:
+                    self.collection = self.client.create_collection(
+                        name=self.collection_name,
+                        metadata=metadata
+                    )
+                    if self.verbose:
+                        print(f"Collection created without embedding function")
                 
                 if self.verbose:
                     print(f"Collection '{self.collection_name}' created successfully")
             else:
-                # Get existing collection
-                self.collection = self.client.get_collection(name=self.collection_name)
+                # Get existing collection, with or without embedding function
+                if self.use_embedding_function and embedding_function is not None:
+                    self.collection = self.client.get_collection(
+                        name=self.collection_name, 
+                        embedding_function=embedding_function
+                    )
+                else:
+                    self.collection = self.client.get_collection(
+                        name=self.collection_name
+                    )
                 
                 if self.verbose:
                     print(f"Using existing collection '{self.collection_name}'")
@@ -165,13 +269,56 @@ class ChromaDBManager(VectorDBInterface):
             print(f"Error creating collection: {str(e)}")
             raise
 
-    def search_keyword(self, query: str, limit: int = 10, score_threshold: float = None,
-                      rerank: bool = False, reranker_type: str = None):
+    def _sanitize_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Sanitize metadata to ensure it only contains valid types for ChromaDB.
+        ChromaDB only accepts str, int, float, or bool as metadata values.
+        
+        Args:
+            metadata: Original metadata dictionary
+            
+        Returns:
+            Sanitized metadata dictionary
+        """
+        sanitized = {}
+        
+        for key, value in metadata.items():
+            # Skip None values completely
+            if value is None:
+                continue
+            
+            # Handle basic types that ChromaDB accepts
+            if isinstance(value, (str, int, float, bool)):
+                sanitized[key] = value
+            # Convert lists and tuples of primitive types to strings
+            elif isinstance(value, (list, tuple)):
+                # Convert each item to string and join
+                try:
+                    sanitized[key] = json.dumps(value)
+                except:
+                    # Fallback: just convert the whole list to string
+                    sanitized[key] = str(value)
+            # Convert dictionaries to JSON strings
+            elif isinstance(value, dict):
+                try:
+                    sanitized[key] = json.dumps(value)
+                except:
+                    sanitized[key] = str(value)
+            # Convert anything else to string
+            else:
+                sanitized[key] = str(value)
+                
+        return sanitized
+
+    def search_keyword(self, query: str, processor: Any = None, limit: int = 10, 
+                      score_threshold: float = None, rerank: bool = False, 
+                      reranker_type: str = None):
         """
         Perform keyword-based search using ChromaDB's built-in functionality.
         
         Args:
             query: Search query string
+            processor: Document processor with embedding capabilities (optional for keyword search)
             limit: Maximum number of results to return
             score_threshold: Minimum score threshold
             rerank: Whether to apply reranking
@@ -187,12 +334,21 @@ class ChromaDBManager(VectorDBInterface):
             if self.verbose:
                 print(f"Executing keyword search for query: '{query}'")
                 
+            # Get more results than needed for post-filtering
+            # This helps ensure we find documents actually containing the query
+            fetch_limit = max(100, limit * 10)
+            
             # Search using query text
-            results = self.collection.query(
-                query_texts=query,
-                n_results=limit,
-                include=["documents", "metadatas", "distances"]
-            )
+            try:
+                results = self.collection.query(
+                    query_texts=[query],  # ChromaDB expects a list of query texts
+                    n_results=fetch_limit,
+                    include=["documents", "metadatas", "distances"]
+                )
+            except Exception as e:
+                if self.verbose:
+                    print(f"Error in keyword search: {e}")
+                return {"error": f"Error in keyword search: {e}"}
             
             # Process results
             points = []
@@ -203,59 +359,126 @@ class ChromaDBManager(VectorDBInterface):
                     print("No results found for keyword search")
                 return []
             
-            # Extract results
+            # Initialize adapter class
+            class ChromaDBPoint:
+                def __init__(self, id, payload, score):
+                    self.id = id
+                    self.payload = payload
+                    self.score = score
+            
+            # Extract and filter results, prioritizing exact matches
+            # 1. First, identify results that actually contain the query terms
+            query_terms = [term.lower() for term in query.split() if len(term) > 2]
+            exact_matches = []
+            partial_matches = []
+            
             for i in range(len(results['ids'][0])):
                 doc_id = results['ids'][0][i]
                 document = results['documents'][0][i]
                 metadata = results['metadatas'][0][i]
                 distance = results['distances'][0][i]
                 
-                # Convert distance to score (ChromaDB returns L2 distance, lower is better)
-                # Transform to a 0-1 score where 1 is best
-                score = 1.0 / (1.0 + distance)
+                # Check if document actually contains query terms
+                document_lower = document.lower()
                 
-                # Apply score threshold if provided
-                if score_threshold is not None and score < score_threshold:
-                    continue
+                # Calculate relevance based on exact and partial matches
+                relevance_score = 0
                 
-                # Build result object with both document and metadata
-                result = {
-                    "id": doc_id,
-                    "text": document,  # Original document text
-                    "score": score
-                }
+                # Check for exact query match (highest relevance)
+                if query.lower() in document_lower:
+                    relevance_score = 1.0
+                else:
+                    # Count how many query terms are in the document
+                    matched_terms = [term for term in query_terms if term in document_lower]
+                    term_ratio = len(matched_terms) / len(query_terms) if query_terms else 0
+                    
+                    if term_ratio > 0:
+                        # Some terms match - calculate weighted score
+                        # More weight to exact matches, some weight to semantic similarity
+                        vector_score = 1.0 / (1.0 + distance)  # Convert distance to 0-1 score
+                        relevance_score = (term_ratio * 0.8) + (vector_score * 0.2)
+                    else:
+                        # No terms match - use only semantic similarity with low weight
+                        relevance_score = (1.0 / (1.0 + distance)) * 0.2
                 
-                # Add metadata fields
+                # Process metadata for ChromaDB
+                processed_metadata = {}
+                chunk_index = 0
+                file_path = ""
+                file_name = ""
+                
                 for key, value in metadata.items():
-                    # Skip sparse vector data in metadata for cleaner results
-                    if key not in ['sparse_indices', 'sparse_values']:
-                        result[key] = value
+                    if key == "chunk_index":
+                        # Extract and convert chunk_index
+                        if isinstance(value, str):
+                            try:
+                                chunk_index = int(value)
+                            except ValueError:
+                                chunk_index = 0
+                        else:
+                            chunk_index = value
+                    elif key == "file_path":
+                        file_path = value
+                    elif key == "file_name":
+                        file_name = value
+                    else:
+                        # Add to processed metadata
+                        processed_metadata[key] = value
                 
-                # Add payload for compatibility
-                result["payload"] = {
+                # Create a properly structured payload
+                payload = {
                     "id": doc_id,
                     "text": document,
-                    "score": score,
-                    **{k: v for k, v in metadata.items() if k not in ['sparse_indices', 'sparse_values']}
+                    "score": relevance_score,
+                    "chunk_index": chunk_index,
+                    "file_path": file_path,
+                    "file_name": file_name,
+                    # Add a proper metadata dict with embedder info
+                    "metadata": {
+                        "dense_embedder": self.dense_model_id,
+                        "sparse_embedder": self.sparse_model_id,
+                        **processed_metadata
+                    }
                 }
                 
-                points.append(result)
+                # Create a point object with our adapter class
+                point = ChromaDBPoint(doc_id, payload, relevance_score)
+                
+                # Sort into exact or partial matches
+                if query.lower() in document_lower or term_ratio > 0.5:
+                    exact_matches.append(point)
+                else:
+                    partial_matches.append(point)
+            
+            # Sort each category by relevance score
+            exact_matches.sort(key=lambda p: p.score, reverse=True)
+            partial_matches.sort(key=lambda p: p.score, reverse=True)
+            
+            # Combine lists, prioritizing exact matches
+            points = exact_matches + partial_matches
+            
+            # Apply threshold if specified
+            if score_threshold is not None:
+                points = [p for p in points if p.score >= score_threshold]
             
             if self.verbose:
-                print(f"Keyword search returned {len(points)} results")
+                print(f"Filtered keyword search returned {len(points)} results")
+                print(f"   - Exact matches: {len(exact_matches)}")
+                print(f"   - Partial matches: {len(partial_matches)}")
             
-            # Apply reranking if requested
-            if rerank and points and processor:
+            # Apply reranking if requested - only if processor is provided
+            if rerank and points and processor is not None:
                 if self.verbose:
                     print(f"Applying {reranker_type or 'default'} reranking")
                 
                 points = SearchAlgorithms.rerank_results(query, points, processor, limit, self.verbose)
             
-            # Record metrics if ground truth is available
-            true_context = getattr(processor, 'expected_context', None) if rerank and processor else None
-            if true_context:
-                hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in points)
-                self._record_hit("keyword", hit)
+            # Record metrics if ground truth is available - only if processor is provided
+            if processor is not None:
+                true_context = getattr(processor, 'expected_context', None)
+                if true_context:
+                    hit = any(hasattr(p, "payload") and p.payload and p.payload.get("text") == true_context for p in points)
+                    self._record_hit("keyword", hit)
             
             return points[:limit]
             
@@ -285,33 +508,49 @@ class ChromaDBManager(VectorDBInterface):
         Returns:
             List of search results
         """
-        if processor is None:
-            return {"error": "Hybrid search requires an embedding model"}
+        if not self.use_embedding_function and processor is None:
+            return {"error": "Hybrid search requires an embedding model or ChromaDB embedding function"}
         
         try:
             # Get more results than needed for fusion
             fetch_limit = prefetch_limit
-            
-            # Generate query embedding
-            query_vector = processor.get_embedding(query)
             
             if self.verbose:
                 print(f"Executing hybrid search for query: '{query}'")
                 print(f"Using fusion type: {fusion_type}")
             
             # Step 1: Get dense search results
-            dense_results = self.collection.query(
-                query_embeddings=query_vector.tolist(),
-                n_results=fetch_limit,
-                include=["documents", "metadatas", "distances"]
-            )
-            
-            # Step 2: Get keyword search results
-            keyword_results = self.collection.query(
-                query_texts=query,
-                n_results=fetch_limit,
-                include=["documents", "metadatas", "distances"]
-            )
+            if self.use_embedding_function:
+                # When using embedding function, there's no difference between vector and keyword search
+                # in the API call, so we'll get both results the same way
+                dense_results = self.collection.query(
+                    query_texts=[query],
+                    n_results=fetch_limit,
+                    include=["documents", "metadatas", "distances"]
+                )
+                
+                keyword_results = self.collection.query(
+                    query_texts=[query],
+                    n_results=fetch_limit,
+                    include=["documents", "metadatas", "distances"]
+                )
+            else:
+                # Generate query embedding
+                query_vector = processor.get_embedding(query)
+                
+                # Step 1: Get dense search results with query vector
+                dense_results = self.collection.query(
+                    query_embeddings=[query_vector.tolist()],
+                    n_results=fetch_limit,
+                    include=["documents", "metadatas", "distances"]
+                )
+                
+                # Step 2: Get keyword search results with query text
+                keyword_results = self.collection.query(
+                    query_texts=[query],
+                    n_results=fetch_limit,
+                    include=["documents", "metadatas", "distances"]
+                )
             
             # Process dense results
             dense_points = []
@@ -434,18 +673,19 @@ class ChromaDBManager(VectorDBInterface):
         Returns:
             List of search results
         """
-        if processor is None:
-            return {"error": "Sparse search requires an embedding model"}
+        if not self.use_embedding_function and processor is None:
+            return {"error": "Sparse search requires an embedding model or ChromaDB embedding function"}
         
         try:
             if self.verbose:
                 print(f"Executing sparse search for query: '{query}'")
             
             # Generate sparse vector for query
-            sparse_indices, sparse_values = processor.get_sparse_embedding(query)
-            
-            if self.verbose:
-                print(f"Generated sparse vector with {len(sparse_indices)} dimensions")
+            if not self.use_embedding_function:
+                sparse_indices, sparse_values = processor.get_sparse_embedding(query)
+                
+                if self.verbose:
+                    print(f"Generated sparse vector with {len(sparse_indices)} dimensions")
             
             # Since ChromaDB doesn't support sparse vectors natively,
             # we'll do a full-text search first, then re-rank based on sparse vector similarity
@@ -455,7 +695,7 @@ class ChromaDBManager(VectorDBInterface):
             
             # First, do a full-text search to get candidates
             results = self.collection.query(
-                query_texts=query,
+                query_texts=[query],
                 n_results=fetch_limit,
                 include=["documents", "metadatas", "distances"]
             )
@@ -477,21 +717,41 @@ class ChromaDBManager(VectorDBInterface):
                 # Check if document has sparse vector info in metadata
                 if 'sparse_indices' in metadata and 'sparse_values' in metadata:
                     # Extract sparse vector from metadata
-                    doc_sparse_indices = [int(idx) for idx in metadata['sparse_indices']]
-                    doc_sparse_values = [float(val) for val in metadata['sparse_values']]
-                    
-                    # Calculate sparse similarity (dot product)
-                    similarity = 0.0
-                    query_sparse_dict = {idx: val for idx, val in zip(sparse_indices, sparse_values)}
-                    for idx, val in zip(doc_sparse_indices, doc_sparse_values):
-                        if idx in query_sparse_dict:
-                            similarity += val * query_sparse_dict[idx]
-                    
-                    # Normalize similarity score to 0-1 range
-                    score = min(1.0, similarity)
+                    try:
+                        # Handle JSON-encoded sparse vectors
+                        if isinstance(metadata['sparse_indices'], str) and metadata['sparse_indices'].startswith('['):
+                            doc_sparse_indices = json.loads(metadata['sparse_indices'])
+                            doc_sparse_values = json.loads(metadata['sparse_values'])
+                        else:
+                            # Legacy format: list of strings
+                            doc_sparse_indices = [int(idx) for idx in metadata['sparse_indices']]
+                            doc_sparse_values = [float(val) for val in metadata['sparse_values']]
+                        
+                        # Calculate sparse similarity (dot product)
+                        # Only if not using embedding function
+                        if not self.use_embedding_function:
+                            similarity = 0.0
+                            query_sparse_dict = {idx: val for idx, val in zip(sparse_indices, sparse_values)}
+                            for idx, val in zip(doc_sparse_indices, doc_sparse_values):
+                                if idx in query_sparse_dict:
+                                    similarity += val * query_sparse_dict[idx]
+                            
+                            # Normalize similarity score to 0-1 range
+                            score = min(1.0, similarity)
+                        else:
+                            # When using embedding function, we'll just use the distance-based score
+                            distance = results['distances'][0][i]
+                            score = 1.0 / (1.0 + distance)  # Convert distance to score
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"Error processing sparse vector for document {doc_id}: {e}")
+                        # Fallback score
+                        distance = results['distances'][0][i]
+                        score = 1.0 / (1.0 + distance)  # Convert distance to score
                 else:
-                    # If document doesn't have sparse vector info, assign lower score
-                    score = 0.5
+                    # If document doesn't have sparse vector info, use the distance-based score
+                    distance = results['distances'][0][i]
+                    score = 1.0 / (1.0 + distance)  # Convert distance to score
                 
                 # Apply score threshold if provided
                 if score_threshold is not None and score < score_threshold:
@@ -504,9 +764,9 @@ class ChromaDBManager(VectorDBInterface):
                     "score": score
                 }
                 
-                # Add metadata fields
+                # Add metadata fields, skipping large sparse vector data
                 for key, value in metadata.items():
-                    if key not in ['sparse_indices', 'sparse_values']:  # Skip sparse vector data
+                    if key not in ['sparse_indices', 'sparse_values']:
                         result[key] = value
                 
                 # Add payload for compatibility
@@ -580,18 +840,18 @@ class ChromaDBManager(VectorDBInterface):
             
             # Determine correct search method based on type
             if search_type.lower() in ["vector", "dense"]:
-                if processor is None:
-                    return {"error": "Vector search requires an embedding model"}
+                if not self.use_embedding_function and processor is None:
+                    return {"error": "Vector search requires an embedding model or embedding function"}
                 points = self.search_dense(query, processor, limit, score_threshold, rerank, reranker_type)
             elif search_type.lower() == "sparse":
-                if processor is None:
-                    return {"error": "Sparse search requires an embedding model"}
+                if not self.use_embedding_function and processor is None:
+                    return {"error": "Sparse search requires an embedding model or embedding function"}
                 points = self.search_sparse(query, processor, limit, score_threshold, rerank, reranker_type)
             elif search_type.lower() in ["keyword", "fts"]:
-                points = self.search_keyword(query, limit, score_threshold, rerank, reranker_type)
+                points = self.search_keyword(query, processor, limit, score_threshold, rerank, reranker_type)
             else:  # Default to hybrid
-                if processor is None:
-                    return {"error": "Hybrid search requires an embedding model"}
+                if not self.use_embedding_function and processor is None:
+                    return {"error": "Hybrid search requires an embedding model or embedding function"}
                 points = self.search_hybrid(query, processor, limit, prefetch_limit,
                                         fusion_type, score_threshold, rerank, reranker_type)
             
@@ -629,43 +889,140 @@ class ChromaDBManager(VectorDBInterface):
         and return a combined text string.
         """
         try:
+            # Make sure chunk_index is an integer
+            if isinstance(chunk_index, str):
+                try:
+                    chunk_index = int(chunk_index)
+                except ValueError:
+                    chunk_index = 0
+            
             # Calculate range of chunk indices to retrieve
             min_idx = max(0, chunk_index - window)
             max_idx = chunk_index + window
             
-            # Create a metadata filter for the file path
-            where_filter = {
-                "$and": [
-                    {"file_path": file_path},
-                    {"chunk_index": {"$gte": min_idx}},
-                    {"chunk_index": {"$lte": max_idx}}
-                ]
-            }
+            if self.verbose:
+                print(f"Retrieving context for file_path: {file_path}, chunk_index: {chunk_index}, window: {window}")
             
-            # Query for chunks within the window
-            results = self.collection.query(
-                query_texts=None,
-                where=where_filter,
-                n_results=window * 2 + 1,  # Max possible chunks in window
-                include=["documents", "metadatas"]
-            )
+            # First try - use where filter with proper number types
+            try:
+                # Build a where filter for ChromaDB - using only strings for compatibility
+                where_filter = {
+                    "$and": [
+                        {"file_path": {"$eq": str(file_path)}},
+                        {"chunk_index": {"$gte": int(min_idx)}},
+                        {"chunk_index": {"$lte": int(max_idx)}}
+                    ]
+                }
+                
+                # Query for chunks within the window
+                results = self.collection.query(
+                    query_texts=["context retrieval"],  # Non-empty query text required
+                    where=where_filter,
+                    n_results=window * 2 + 1,  # Max possible chunks in window
+                    include=["documents", "metadatas"]
+                )
+            except Exception as e:
+                if self.verbose:
+                    print(f"First context retrieval attempt failed: {e}")
+                
+                # Second try - simplified approach with only file_path
+                try:
+                    where_filter = {
+                        "file_path": {"$eq": str(file_path)}
+                    }
+                    
+                    results = self.collection.query(
+                        query_texts=["context retrieval"],
+                        where=where_filter,
+                        n_results=100,  # Get more results to filter manually
+                        include=["documents", "metadatas"]
+                    )
+                    
+                    # Manual filtering by chunk_index
+                    filtered_docs = []
+                    
+                    for i, metadata in enumerate(results['metadatas'][0]):
+                        if not metadata:
+                            continue
+                            
+                        # Extract chunk_index, handling possible string values
+                        doc_chunk_index = metadata.get('chunk_index', None)
+                        
+                        # Skip if no chunk_index
+                        if doc_chunk_index is None:
+                            continue
+                            
+                        # Convert to int if it's a string
+                        if isinstance(doc_chunk_index, str):
+                            try:
+                                doc_chunk_index = int(doc_chunk_index)
+                            except ValueError:
+                                continue
+                                
+                        # Check if in range
+                        if min_idx <= doc_chunk_index <= max_idx:
+                            doc_text = results['documents'][0][i]
+                            filtered_docs.append((doc_chunk_index, doc_text))
+                    
+                    # Sort by chunk_index
+                    filtered_docs.sort(key=lambda x: x[0])
+                    
+                    # Combine text
+                    combined_text = "\n".join([doc[1] for doc in filtered_docs])
+                    return combined_text
+                    
+                except Exception as e2:
+                    if self.verbose:
+                        print(f"Second context retrieval attempt failed: {e2}")
+                    
+                    # Last resort - try basic text query
+                    try:
+                        # Just search for the file path in a query
+                        results = self.collection.query(
+                            query_texts=[file_path],
+                            n_results=5,
+                            include=["documents"]
+                        )
+                        
+                        # Return all text combined
+                        if results['documents'][0]:
+                            return "\n".join(results['documents'][0])
+                        else:
+                            return ""
+                    except Exception as e3:
+                        if self.verbose:
+                            print(f"All context retrieval attempts failed: {e3}")
+                        return ""
             
             # Check if we have any results
-            if not results['ids'][0]:
+            if not results['documents'][0]:
+                if self.verbose:
+                    print("No context chunks found")
                 return ""
             
-            # Extract document texts and their chunk indices
-            chunks = []
-            for i in range(len(results['ids'][0])):
-                document = results['documents'][0][i]
-                metadata = results['metadatas'][0][i]
-                chunks.append((metadata.get('chunk_index', 0), document))
+            # For successful first attempt, process the results
+            docs_with_indices = []
             
-            # Sort chunks by chunk index
-            chunks.sort(key=lambda x: x[0])
+            for i, doc in enumerate(results['documents'][0]):
+                metadata = results['metadatas'][0][i]
+                
+                # Extract chunk_index, handling possible string values
+                doc_chunk_index = metadata.get('chunk_index', i)
+                
+                # Convert to int if it's a string
+                if isinstance(doc_chunk_index, str):
+                    try:
+                        doc_chunk_index = int(doc_chunk_index)
+                    except ValueError:
+                        doc_chunk_index = i
+                
+                docs_with_indices.append((doc_chunk_index, doc))
+            
+            # Sort by chunk index
+            docs_with_indices.sort(key=lambda x: x[0])
             
             # Combine text from all chunks
-            combined_text = "\n".join([chunk[1] for chunk in chunks])
+            combined_text = "\n".join([doc[1] for doc in docs_with_indices])
             
             return combined_text
             
@@ -705,25 +1062,36 @@ class ChromaDBManager(VectorDBInterface):
         Returns:
             List of search results
         """
-        if processor is None:
-            return {"error": "Vector search requires an embedding model"}
+        if not self.use_embedding_function and processor is None:
+            return {"error": "Vector search requires an embedding model or ChromaDB embedding function"}
         
         try:
-            # Generate query embedding
-            query_vector = processor.get_embedding(query)
-            
-            if self.verbose:
-                print(f"Executing vector search with {len(query_vector)}-dimensional query vector")
-            
             # Get more results than needed if reranking
             fetch_limit = limit * 3 if rerank else limit
             
-            # Search using query embedding
-            results = self.collection.query(
-                query_embeddings=query_vector.tolist(),
-                n_results=fetch_limit,
-                include=["documents", "metadatas", "distances"]
-            )
+            # If using embedding function, use query_texts instead of query_embeddings
+            if self.use_embedding_function:
+                if self.verbose:
+                    print(f"Using ChromaDB embedding function for vector search")
+                
+                results = self.collection.query(
+                    query_texts=[query],
+                    n_results=fetch_limit,
+                    include=["documents", "metadatas", "distances"]
+                )
+            else:
+                # Generate query embedding using processor
+                query_vector = processor.get_embedding(query)
+                
+                if self.verbose:
+                    print(f"Executing vector search with {len(query_vector)}-dimensional query vector")
+                
+                # Search using query embedding
+                results = self.collection.query(
+                    query_embeddings=[query_vector.tolist()],
+                    n_results=fetch_limit,
+                    include=["documents", "metadatas", "distances"]
+                )
             
             # Process results
             points = []
@@ -733,6 +1101,13 @@ class ChromaDBManager(VectorDBInterface):
                 if self.verbose:
                     print("No results found for vector search")
                 return []
+            
+            # Initialize adapter class
+            class ChromaDBPoint:
+                def __init__(self, id, payload, score):
+                    self.id = id
+                    self.payload = payload
+                    self.score = score
             
             # Extract results
             for i in range(len(results['ids'][0])):
@@ -749,26 +1124,49 @@ class ChromaDBManager(VectorDBInterface):
                 if score_threshold is not None and score < score_threshold:
                     continue
                 
-                # Build result object with both document and metadata
-                result = {
-                    "id": doc_id,
-                    "text": document,  # Original document text
-                    "score": score
-                }
+                # Process metadata for ChromaDB
+                processed_metadata = {}
+                chunk_index = 0
+                file_path = ""
+                file_name = ""
                 
-                # Add metadata fields
                 for key, value in metadata.items():
-                    result[key] = value
+                    if key == "chunk_index":
+                        # Extract and convert chunk_index
+                        if isinstance(value, str):
+                            try:
+                                chunk_index = int(value)
+                            except ValueError:
+                                chunk_index = 0
+                        else:
+                            chunk_index = value
+                    elif key == "file_path":
+                        file_path = value
+                    elif key == "file_name":
+                        file_name = value
+                    elif key not in ['sparse_indices', 'sparse_values']:
+                        # Skip sparse vector data, add all other metadata
+                        processed_metadata[key] = value
                 
-                # Add payload for compatibility
-                result["payload"] = {
+                # Create a properly structured payload
+                payload = {
                     "id": doc_id,
                     "text": document,
                     "score": score,
-                    **metadata
+                    "chunk_index": chunk_index,
+                    "file_path": file_path,
+                    "file_name": file_name,
+                    # Add a proper metadata dict with embedder info
+                    "metadata": {
+                        "dense_embedder": self.dense_model_id,
+                        "sparse_embedder": self.sparse_model_id,
+                        **processed_metadata
+                    }
                 }
                 
-                points.append(result)
+                # Create a point object with our adapter class
+                point = ChromaDBPoint(doc_id, payload, score)
+                points.append(point)
             
             if self.verbose:
                 print(f"Vector search returned {len(points)} results")
@@ -809,10 +1207,10 @@ class ChromaDBManager(VectorDBInterface):
                 raise ValueError(f"Collection '{self.collection_name}' not initialized")
             
             # Prepare documents for insertion
-            embeddings = []
             documents = []
             metadatas = []
             ids = []
+            embeddings = []
             
             for i, (embedding, payload) in enumerate(embeddings_with_payloads):
                 # Generate ID if not provided
@@ -829,17 +1227,23 @@ class ChromaDBManager(VectorDBInterface):
                 else:
                     text = ""
                 
-                # Prepare metadata from payload
+                # Prepare metadata from payload, skipping content/text/id
                 metadata = {k: v for k, v in payload.items() if k not in ['content', 'text', 'id']}
                 
+                # Sanitize metadata to ensure ChromaDB compatibility
+                metadata = self._sanitize_metadata(metadata)
+                
                 # Add documents
-                embeddings.append(embedding.tolist())
                 documents.append(text)
                 metadatas.append(metadata)
                 ids.append(doc_id)
+                
+                # Only add embeddings if not using embedding function
+                if not self.use_embedding_function:
+                    embeddings.append(embedding.tolist())
             
             if self.verbose:
-                print(f"Inserting {len(documents)} documents with embeddings")
+                print(f"Inserting {len(documents)} documents")
             
             # Insert in batches to handle large datasets
             batch_size = 100
@@ -849,13 +1253,21 @@ class ChromaDBManager(VectorDBInterface):
                 if self.verbose and len(documents) > batch_size:
                     print(f"Inserting batch {i//batch_size + 1}/{(len(documents)-1)//batch_size + 1}")
                 
-                # Insert the batch
-                self.collection.add(
-                    embeddings=embeddings[i:end],
-                    documents=documents[i:end],
-                    metadatas=metadatas[i:end],
-                    ids=ids[i:end]
-                )
+                # If using embedding function, don't provide embeddings
+                if self.use_embedding_function:
+                    self.collection.add(
+                        documents=documents[i:end],
+                        metadatas=metadatas[i:end],
+                        ids=ids[i:end]
+                    )
+                else:
+                    # Otherwise provide pre-computed embeddings
+                    self.collection.add(
+                        embeddings=embeddings[i:end],
+                        documents=documents[i:end],
+                        metadatas=metadatas[i:end],
+                        ids=ids[i:end]
+                    )
             
             if self.verbose:
                 print(f"Successfully inserted {len(documents)} documents")
@@ -993,15 +1405,21 @@ class ChromaDBManager(VectorDBInterface):
                 sparse_indices, sparse_values = sparse_vector
                 
                 # Store only non-zero values from sparse vector to save space
-                # Convert to strings for serialization
-                metadata["sparse_indices"] = [str(idx) for idx in sparse_indices]
-                metadata["sparse_values"] = [str(val) for val in sparse_values]
+                # Convert to strings for serialization and compatibility with ChromaDB
+                metadata["sparse_indices"] = json.dumps([int(idx) for idx in sparse_indices])
+                metadata["sparse_values"] = json.dumps([float(val) for val in sparse_values])
+                
+                # Sanitize metadata to ensure ChromaDB compatibility
+                metadata = self._sanitize_metadata(metadata)
                 
                 # Add documents
-                embeddings.append(dense_embedding.tolist())
                 documents.append(text)
                 metadatas.append(metadata)
                 ids.append(doc_id)
+                
+                # Only add embeddings if not using embedding function
+                if not self.use_embedding_function:
+                    embeddings.append(dense_embedding.tolist())
             
             if self.verbose:
                 print(f"Inserting {len(documents)} documents with embeddings and sparse vectors")
@@ -1014,13 +1432,21 @@ class ChromaDBManager(VectorDBInterface):
                 if self.verbose and len(documents) > batch_size:
                     print(f"Inserting batch {i//batch_size + 1}/{(len(documents)-1)//batch_size + 1}")
                 
-                # Insert the batch
-                self.collection.add(
-                    embeddings=embeddings[i:end],
-                    documents=documents[i:end],
-                    metadatas=metadatas[i:end],
-                    ids=ids[i:end]
-                )
+                # If using embedding function, don't provide embeddings
+                if self.use_embedding_function:
+                    self.collection.add(
+                        documents=documents[i:end],
+                        metadatas=metadatas[i:end],
+                        ids=ids[i:end]
+                    )
+                else:
+                    # Otherwise provide pre-computed embeddings
+                    self.collection.add(
+                        embeddings=embeddings[i:end],
+                        documents=documents[i:end],
+                        metadatas=metadatas[i:end],
+                        ids=ids[i:end]
+                    )
             
             if self.verbose:
                 print(f"Successfully inserted {len(documents)} documents with sparse vectors")

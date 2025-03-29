@@ -163,6 +163,8 @@ def run_search(args):
         db_args.update({
             "host": args.chromadb_host,
             "port": args.chromadb_port,
+            "use_embedding_function": args.chromadb_use_embedding_function,
+            "embedding_function_model": args.chromadb_embedding_model
         })
     elif db_type.lower() == 'elasticsearch':
         db_args.update({
@@ -479,6 +481,8 @@ def run_indexing(args):
             db_args.update({
                 "host": args.chromadb_host,
                 "port": args.chromadb_port,
+                "use_embedding_function": args.chromadb_use_embedding_function,
+                "embedding_function_model": args.chromadb_embedding_model
             })
         elif db_type.lower() == 'elasticsearch':
             db_args.update({
@@ -762,7 +766,11 @@ def main():
                             help="ChromaDB host (for remote API)")
     chromadb_group.add_argument("--chromadb-port", dest="chromadb_port", type=int, 
                             help="ChromaDB port (for remote API)")
-
+    chromadb_group.add_argument("--chromadb-use-embedding-function", dest="chromadb_use_embedding_function", 
+                           action="store_true", help="Use ChromaDB's built-in embedding functions")
+    chromadb_group.add_argument("--chromadb-embedding-model", dest="chromadb_embedding_model", type=str,
+                            default="sentence-transformers/all-MiniLM-L6-v2",
+                            help="Model to use with ChromaDB's embedding function")
     
     # Search command
     search_parser = subparsers.add_parser("search", help="Search documents")
@@ -829,7 +837,11 @@ def main():
                                     help="ChromaDB host (for remote API)")
     chromadb_search_group.add_argument("--chromadb-port", dest="chromadb_port", type=int, 
                                     help="ChromaDB port (for remote API)")
-
+    chromadb_search_group.add_argument("--chromadb-use-embedding-function", dest="chromadb_use_embedding_function", 
+                                  action="store_true", help="Use ChromaDB's built-in embedding functions")
+    chromadb_search_group.add_argument("--chromadb-embedding-model", dest="chromadb_embedding_model", type=str,
+                                    default="sentence-transformers/all-MiniLM-L6-v2",
+                                    help="Model to use with ChromaDB's embedding function")
 
     
     # List models command
