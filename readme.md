@@ -5,8 +5,8 @@ A vector search system supporting multiple database backends and embedding provi
 ## Overview
 
 Implements a modular system for semantic search using vector embeddings. It supports:
-- Multiple database backends: Qdrant, LanceDB, Meilisearch (others in progress)
-- Multiple embedding providers: MLX, Ollama
+- Multiple database backends: Qdrant, LanceDB, Meilisearch, Chroma, Elasticsearch (others in progress)
+- Multiple embedding providers: MLX, Ollama (others in progress)
 - Dense and (if supported by db) sparse vector representations
 - Hybrid search with multiple fusion algorithms
 - Vector reranking options
@@ -78,7 +78,7 @@ python mlxrag.py index ./path/to/documents \
 ```
 
 Options:
-- `--db-type`: Choose from "qdrant", "lancedb", "meilisearch" (WIP: "elasticsearch", "milvus")
+- `--db-type`: Choose from "qdrant", "lancedb", "meilisearch", "chromadb", "elasticsearch" (WIP: "milvus")
 - `--use-mlx-models`, `--use-ollama` (WIP: `--use-fastembed`): Choose embedding provider
 - `--dense-model`: Dense embedding model to use
 - `--sparse-model`: Sparse embedding model to use
