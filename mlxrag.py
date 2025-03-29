@@ -159,6 +159,11 @@ def run_search(args):
             "url": args.meilisearch_url,
             "api_key": args.meilisearch_api_key,
         })
+    elif db_type.lower() == 'chromadb':
+        db_args.update({
+            "host": args.chromadb_host,
+            "port": args.chromadb_port,
+        })
     elif db_type.lower() == 'elasticsearch':
         db_args.update({
             "hosts": args.es_hosts,
@@ -470,6 +475,11 @@ def run_indexing(args):
                 "url": args.meilisearch_url,
                 "api_key": args.meilisearch_api_key,
             })
+        elif db_type.lower() == 'chromadb':
+            db_args.update({
+                "host": args.chromadb_host,
+                "port": args.chromadb_port,
+            })
         elif db_type.lower() == 'elasticsearch':
             db_args.update({
                 "hosts": args.es_hosts,
@@ -649,14 +659,14 @@ def main():
     import argparse
     
     # Create the main parser with consistent argument style
-    parser = argparse.ArgumentParser(description="Enhanced Vector Database Indexer with Multiple Backend Support")
+    parser = argparse.ArgumentParser(description="CrispRAG: Vector Database Indexer & Search with Multiple Backend Support")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--storage-path", help="Path to store database data")
     
     # Add database selection option
-    parser.add_argument("--db-type", choices=["qdrant", "lancedb", "meilisearch", "elasticsearch"], 
-                        default="qdrant", help="Vector database backend to use")
-    
+    parser.add_argument("--db-type", choices=["qdrant", "lancedb", "meilisearch", "elasticsearch", "chromadb"], 
+                    default="qdrant", help="Vector database backend to use")
+
     # Create embedding provider group with mutually exclusive options
     embedding_group = parser.add_argument_group("Embedding options")
     embedding_provider = embedding_group.add_mutually_exclusive_group()
@@ -721,9 +731,6 @@ def main():
                              help="Path to store/load MLX weights (fallback)")
     index_parser.add_argument("--recreate", action="store_true", help="Recreate collection if it exists")
     
-    # Don't duplicate these args since they're already in the parent parser
-    # Just ensure the index_parser gets a reference to them when needed
-
     # Add database-specific parameters for Qdrant
     qdrant_group = index_parser.add_argument_group("Qdrant options")
     qdrant_group.add_argument("--host", type=str, default="localhost", help="Qdrant host")
@@ -748,6 +755,14 @@ def main():
     es_group.add_argument("--es-api-key", dest="es_api_key", type=str, help="Elasticsearch API key")
     es_group.add_argument("--es-username", dest="es_username", type=str, help="Elasticsearch username")
     es_group.add_argument("--es-password", dest="es_password", type=str, help="Elasticsearch password")
+
+    # Add database-specific parameters for ChromaDB in the index_parser
+    chromadb_group = index_parser.add_argument_group("ChromaDB options")
+    chromadb_group.add_argument("--chromadb-host", dest="chromadb_host", type=str, 
+                            help="ChromaDB host (for remote API)")
+    chromadb_group.add_argument("--chromadb-port", dest="chromadb_port", type=int, 
+                            help="ChromaDB port (for remote API)")
+
     
     # Search command
     search_parser = subparsers.add_parser("search", help="Search documents")
@@ -807,6 +822,15 @@ def main():
     es_search_group.add_argument("--es-api-key", dest="es_api_key", type=str, help="Elasticsearch API key")
     es_search_group.add_argument("--es-username", dest="es_username", type=str, help="Elasticsearch username")
     es_search_group.add_argument("--es-password", dest="es_password", type=str, help="Elasticsearch password")
+
+    # add ChromaDB options to the search_parser
+    chromadb_search_group = search_parser.add_argument_group("ChromaDB options")
+    chromadb_search_group.add_argument("--chromadb-host", dest="chromadb_host", type=str, 
+                                    help="ChromaDB host (for remote API)")
+    chromadb_search_group.add_argument("--chromadb-port", dest="chromadb_port", type=int, 
+                                    help="ChromaDB port (for remote API)")
+
+
     
     # List models command
     list_parser = subparsers.add_parser("list-models", help="List available MLX embedding models")

@@ -82,7 +82,7 @@ class DBFactory:
         are missing.
         
         Args:
-            db_type: Type of database to create ("qdrant", "lancedb", "meilisearch", "elasticsearch")
+            db_type: Type of database to create ("qdrant", "lancedb", "meilisearch", "elasticsearch", "chromadb")
             **kwargs: Additional arguments for database initialization
                 
         Returns:
@@ -107,7 +107,9 @@ class DBFactory:
             "meilisearch": {"module": "meilisearch_manager", "class": "MeilisearchManager", 
                         "dependencies": ["meilisearch"]},
             "elasticsearch": {"module": "elasticsearch_manager", "class": "ElasticsearchManager", 
-                            "dependencies": ["elasticsearch"]}
+                            "dependencies": ["elasticsearch"]},
+            "chromadb": {"module": "chromadb_manager", "class": "ChromaDBManager",
+                       "dependencies": ["chromadb"]}
         }
         
         # Check if the requested database type is supported
@@ -129,6 +131,12 @@ class DBFactory:
             except ImportError as e:
                 missing_dep = "lancedb" if "lancedb" in str(e) else "pyarrow"
                 raise ValueError(f"LanceDB support not available. Install with: pip install {missing_dep}")
+        
+        if db_type == "chromadb":
+            try:
+                import chromadb
+            except ImportError:
+                raise ValueError(f"ChromaDB support not available. Install with: pip install chromadb")
         
         try:
             # Import specific database module based on type
@@ -152,6 +160,12 @@ class DBFactory:
                     return ElasticsearchManager(**kwargs)
                 except ImportError:
                     raise ValueError("Elasticsearch support not available. Install with: pip install elasticsearch")
+            elif db_type == "chromadb":
+                try:
+                    from chromadb_manager import ChromaDBManager
+                    return ChromaDBManager(**kwargs)
+                except ImportError:
+                    raise ValueError("ChromaDB support not available. Install with: pip install chromadb")
             else:
                 # This should never happen due to the earlier check, but just in case
                 raise ValueError(f"Unsupported database type: {db_type}")
@@ -174,57 +188,3 @@ class DBFactory:
             # Handle any other initialization errors with context
             error_msg = f"Error initializing {db_type} database: {str(e)}"
             raise ValueError(error_msg) from e
-    
-    @staticmethod
-    def create_db_old(db_type: str, **kwargs) -> 'VectorDBInterface':
-        """
-        Create a database instance of the specified type
-        
-        Args:
-            db_type: Type of database to create
-            **kwargs: Additional arguments for database initialization
-            
-        Returns:
-            Instance of the specified database type
-        """
-        # Import directly when needed to avoid circular imports
-        db_type = db_type.lower()
-        
-        if db_type == "qdrant":
-            from qdrant_db import QdrantManager
-            return QdrantManager(**kwargs)
-        elif db_type == "lancedb":
-            try:
-                from lancedb_manager import LanceDBManager
-                return LanceDBManager(**kwargs)
-            except ImportError:
-                raise ValueError("LanceDB support not available. Install with: pip install lancedb pyarrow")
-        elif db_type == "meilisearch":
-            try:
-                from meilisearch_manager import MeilisearchManager
-                return MeilisearchManager(**kwargs)
-            except ImportError:
-                raise ValueError("Meilisearch support not available. Install with: pip install meilisearch")
-        elif db_type == "elasticsearch":
-            try:
-                from elasticsearch_manager import ElasticsearchManager
-                return ElasticsearchManager(**kwargs)
-            except ImportError:
-                raise ValueError("Elasticsearch support not available. Install with: pip install elasticsearch")
-        else:
-            # Try to get available backends if we can't find the specific one
-            try:
-                # First attempt, from main package
-                try:
-                    import sys
-                    if "__init__" in sys.modules:
-                        # If we have a package structure, use that
-                        from __init__ import AVAILABLE_DBS
-                        available = ", ".join(AVAILABLE_DBS.keys())
-                except (ImportError, KeyError):
-                    # Otherwise, hard-code the list
-                    available = "qdrant, lancedb, meilisearch, elasticsearch"
-            except:
-                available = "qdrant, lancedb, meilisearch, elasticsearch"
-                
-            raise ValueError(f"Unsupported database type: {db_type}. Available types: {available}")
