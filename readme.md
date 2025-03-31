@@ -5,11 +5,12 @@ A vector search system supporting multiple database backends and embedding provi
 ## Overview
 
 Implements a modular system for semantic search using vector embeddings. It supports:
-- Multiple database backends: Qdrant, LanceDB, Meilisearch, Chroma, Elasticsearch (others in progress)
+- Multiple database backends: Qdrant, LanceDB, Meilisearch, Chroma, Elasticsearch, Milvus
 - Multiple embedding providers: MLX, Ollama (others in progress)
 - Dense and (if supported by db) sparse vector representations
 - Hybrid search with multiple fusion algorithms
 - Vector reranking options
+- works in progress include: benchmark and streamlit user interface
 
 ## Features
 
@@ -232,6 +233,11 @@ then:
 docker compose down
 docker compose up -d
 python mlxrag.py --verbose --use-mlx-models --db-type milvus index ~/Documents/texte --include "*.txt *.pdf" --limit 5 --recreate
+```
+
+Testing the unfinished ui:
+```bash
+streamlit run ./crisprag_ui.py
 ```
 
 ## Architecture
