@@ -3,4 +3,7 @@ weights/
 qdrant_storage/
 lancedb_storage/
 chromadb_storage/
+benchmark_corpus/
+benchmark_results/
+benchmark_storage/
 arch*.md

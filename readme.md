@@ -147,6 +147,12 @@ services:
       - "2380:2380"
     networks:
       - milvus-network
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
 
   minio:
     container_name: minio
@@ -162,6 +168,12 @@ services:
       - "9001:9001"
     networks:
       - milvus-network
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
 
   milvus:
     container_name: milvus
@@ -178,18 +190,41 @@ services:
       MINIO_ADDRESS: minio:9000
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
+      # Performance tuning
+      QUERY_NODE_LOAD_CACHE_IMMEDIATELY: "true"
+      QUERY_NODE_CACHE_ENABLED: "true"
+      COMMON_GRACEFUL_TIME: "20s"
+      KNOWHERE_GPU_MEM_POOL_SIZE: "2"  # For CPU-only deployment
+      COMMON_STORAGE_CONFIG_PATH: "/var/lib/milvus/configs/storage_config.yaml"
     ports:
       - "19530:19530"
       - "9091:9091"
     networks:
       - milvus-network
+    volumes:
+      - milvus-data:/var/lib/milvus
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 60s
 
 volumes:
   etcd-data:
   minio-data:
+  milvus-data:
 
 networks:
   milvus-network:
+    driver: bridge
 ```
 
 then:
