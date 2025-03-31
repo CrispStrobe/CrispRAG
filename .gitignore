@@ -3,6 +3,7 @@ weights/
 qdrant_storage/
 lancedb_storage/
 chromadb_storage/
+mlxrag_storage/
 benchmark_corpus/
 benchmark_results/
 benchmark_storage/

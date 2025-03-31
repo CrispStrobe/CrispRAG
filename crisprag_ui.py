@@ -9,13 +9,78 @@ Features:
 - Collapsible settings for cleaner interface
 """
 
-import streamlit as st
-import threading
 import os
+import sys
+
+# Prevent Streamlit's file watcher from trying to read torch._classes.__path__
+# This needs to be set before importing torch or streamlit
+os.environ["STREAMLIT_WATCH_MODULES"] = "false"
+
 import tempfile
 import shutil
 import time
-import sys
+
+def patch_watchdog():
+    """
+    Patch Streamlit's file watcher to ignore problematic modules like torch.
+    This prevents errors related to PyTorch's custom classes.
+    """
+    try:
+        from streamlit.watcher import local_sources_watcher
+        
+        # Save the original get_module_paths function
+        original_get_module_paths = local_sources_watcher.get_module_paths
+        
+        # Define a safer replacement function
+        def safe_get_module_paths(modules):
+            result = {}
+            
+            # Handle dictionary case
+            if isinstance(modules, dict):
+                for name, module in modules.items():
+                    if "torch" in name or "numpy" in name:
+                        continue
+                    try:
+                        paths = original_get_module_paths({name: module})
+                        result.update(paths)
+                    except Exception:
+                        pass
+            
+            # Handle single module case - just return empty dict to be safe
+            else:
+                try:
+                    # If it's a single module, we need its name
+                    if hasattr(modules, "__name__"):
+                        name = modules.__name__
+                        if "torch" not in name and "numpy" not in name:
+                            # Try to get paths safely, or just skip it
+                            try:
+                                paths = original_get_module_paths(modules)
+                                result.update(paths)
+                            except Exception:
+                                pass
+                except Exception:
+                    # Any error means we skip this module
+                    pass
+                    
+            return result
+        
+        # Replace the original function with our safer version
+        local_sources_watcher.get_module_paths = safe_get_module_paths
+        
+        print("Successfully patched Streamlit file watcher")
+        
+    except Exception as e:
+        print(f"Failed to patch Streamlit file watcher: {e}")
+        # Just continue without patching if it fails
+
+
+# Apply the patching
+patch_watchdog()
+
+import streamlit as st
+
+import threading
 import json
 from typing import List, Dict, Any, Tuple, Optional
 import fnmatch
@@ -83,7 +148,6 @@ Don't make things up or provide information not supported by the context.
 
 # Global lock for MPS/GPU-critical sections
 gpu_lock = threading.Lock()
-
 
 # Function for the LLM to call to perform a search
 def perform_vector_search(query, search_type="hybrid", limit=10):
@@ -169,6 +233,247 @@ def perform_vector_search(query, search_type="hybrid", limit=10):
             error_msg = traceback.format_exc()
         return json.dumps({"error": error_msg})
     
+def get_db_args(db_type, host, port, storage_path, collection_name, tab_name):
+    """
+    Prepare database arguments based on the database type and settings.
+    
+    Args:
+        db_type: Database type (qdrant, milvus, etc.)
+        host: Database host
+        port: Database port
+        storage_path: Local storage path (if applicable)
+        collection_name: Collection name
+        tab_name: Current tab name for getting unique session state keys
+        
+    Returns:
+        Dictionary of database arguments
+    """
+    import streamlit as st
+    
+    # Common arguments for all database types
+    db_args = {
+        "collection_name": collection_name,
+        "storage_path": storage_path,
+        "verbose": st.session_state.show_debug
+    }
+    
+    # Add database-specific arguments
+    if db_type == "qdrant":
+        db_args.update({
+            "host": host,
+            "port": port
+        })
+    elif db_type == "milvus":
+        db_args.update({
+            "host": host,
+            "port": port,
+            "user": st.session_state.get(f"milvus_user_{tab_name}", ""),
+            "password": st.session_state.get(f"milvus_password_{tab_name}", ""),
+            "secure": st.session_state.get(f"milvus_secure_{tab_name}", False)
+        })
+    elif db_type == "lancedb":
+        db_args.update({
+            "uri": st.session_state.get(f"lancedb_uri_{tab_name}", "")
+        })
+    elif db_type == "meilisearch":
+        db_args.update({
+            "url": st.session_state.get(f"meilisearch_url_{tab_name}", "http://localhost:7700"),
+            "api_key": st.session_state.get(f"meilisearch_api_key_{tab_name}", "")
+        })
+    elif db_type == "elasticsearch":
+        es_hosts_list = [h.strip() for h in st.session_state.get(f"es_hosts_{tab_name}", "http://localhost:9200").split(",")]
+        db_args.update({
+            "hosts": es_hosts_list,
+            "api_key": st.session_state.get(f"es_api_key_{tab_name}", ""),
+            "username": st.session_state.get(f"es_username_{tab_name}", ""),
+            "password": st.session_state.get(f"es_password_{tab_name}", "")
+        })
+    
+    return db_args
+
+def close_db_connection():
+    """
+    Safely close the database connection if one exists.
+    This prevents the "already accessed by another instance" error with Qdrant.
+    """
+    import streamlit as st
+    
+    if 'db_manager' in st.session_state and st.session_state.db_manager:
+        try:
+            if hasattr(st.session_state.db_manager, 'client'):
+                # Special handling for Qdrant
+                if hasattr(st.session_state.db_manager, 'db_type') and st.session_state.db_manager.db_type == 'qdrant':
+                    if hasattr(st.session_state.db_manager.client, 'close'):
+                        st.session_state.db_manager.client.close()
+                # For other database types
+                elif hasattr(st.session_state.db_manager.client, 'close'):
+                    st.session_state.db_manager.client.close()
+            
+            # Remove the db_manager from session state
+            st.session_state.db_manager = None
+            st.session_state.search_initialized = False
+            return True
+        except Exception as e:
+            if st.session_state.show_debug:
+                st.error(f"Error closing database connection: {e}")
+            return False
+    return True  # No connection to close
+
+def create_db_manager(db_type, db_args):
+    """
+    Create a database manager with proper cleanup of previous connections.
+    
+    Args:
+        db_type: Database type (qdrant, milvus, etc.)
+        db_args: Dictionary of database arguments
+        
+    Returns:
+        The created database manager or None if creation failed
+    """
+    import streamlit as st
+    
+    # First, close any existing connection
+    close_db_connection()
+    
+    try:
+        # Import the DBFactory
+        from vector_db_interface import DBFactory
+        
+        # Create the database manager with gpu_safe_call
+        db_manager = gpu_safe_call(DBFactory.create_db, db_type, **db_args)
+        
+        # Store the db_type for later reference
+        db_manager.db_type = db_type
+        
+        return db_manager
+    except Exception as e:
+        st.error(f"Error creating database manager: {e}")
+        if st.session_state.show_debug:
+            import traceback
+            st.error(traceback.format_exc())
+        return None
+
+def on_session_end():
+    """
+    Callback function for session end to ensure proper DB connection cleanup.
+    """
+    close_db_connection()
+
+# Try to set the session end callback
+try:
+    import streamlit as st
+    if hasattr(st, 'session_state') and hasattr(st.session_state, '_on_session_end'):
+        # Modern Streamlit versions
+        st.session_state._on_session_end = on_session_end
+    elif hasattr(st, 'set_query_params'):
+        # Older Streamlit versions - use a different method
+        st.set_query_params(**{'_session_end_callback': 'registered'})
+except Exception:
+    # If setting a callback fails, just continue
+    pass
+
+def get_storage_path(db_type):
+    """
+    Get the appropriate storage path based on database type.
+    Only certain database types use local storage.
+    
+    Args:
+        db_type: The database type (qdrant, milvus, etc.)
+        
+    Returns:
+        Storage path if local storage is appropriate, None otherwise
+    """
+    import os
+    
+    # Only these database types use local storage
+    if db_type == "qdrant":
+        return os.path.join(os.getcwd(), "qdrant_storage")
+    elif db_type == "lancedb":
+        return os.path.join(os.getcwd(), "lancedb_storage")
+    elif db_type == "chromadb":
+        return os.path.join(os.getcwd(), "chromadb_storage")
+    elif db_type == "meilisearch":
+        return os.path.join(os.getcwd(), "meilisearch_storage")
+    elif db_type == "elasticsearch":
+        return os.path.join(os.getcwd(), "elasticsearch_storage")
+    else:
+        # For default case, use database-specific storage
+        return os.path.join(os.getcwd(), f"{db_type}_storage")
+    
+def handle_connection_settings(tab_name):
+    """
+    Handle connection settings UI and return the appropriate parameters.
+    This creates a consistent interface for both Index and Search tabs.
+    
+    Args:
+        tab_name: Name of the current tab for creating unique keys
+        
+    Returns:
+        Tuple of (db_type, host, port, storage_path, collection_name)
+    """
+    import streamlit as st
+    import os
+    
+    # Check if connection_type is already set in session state
+    connection_type_key = f"connection_type_{tab_name}"
+    if connection_type_key in st.session_state:
+        connection_type = st.session_state[connection_type_key]
+    else:
+        # If not, use the radio button to set it
+        connection_type = st.radio(
+            "Connection Type", 
+            ["Local Storage", "Remote Server"],
+            key=connection_type_key
+        )
+    
+    # Database selection
+    db_type = st.selectbox(
+        "Database Backend", 
+        ["qdrant", "milvus", "lancedb", "meilisearch", "elasticsearch", "chromadb"],
+        key=f"db_type_{tab_name}",
+        help="Select the vector database backend to use"
+    )
+    
+    # Set default connection parameters
+    if connection_type == "Local Storage":
+        host = "localhost"
+        port = 6333
+        storage_path = get_storage_path(db_type)
+        
+        # Only show storage path info if the database type uses local storage
+        if storage_path:
+            st.info(f"Using local storage at: {storage_path}")
+        else:
+            st.warning(f"{db_type.capitalize()} doesn't typically use local storage. Consider using Remote Server instead.")
+            # Set a default path anyway
+            storage_path = os.path.join(os.getcwd(), f"{db_type}_storage")
+    else:
+        host = st.text_input("Host", "localhost", key=f"host_{tab_name}")
+        port = st.number_input("Port", value=6333, min_value=1, max_value=65535, key=f"port_{tab_name}")
+        storage_path = None
+    
+    # Add specific database settings based on selection
+    if db_type == "milvus":
+        st.text_input("Milvus User", key=f"milvus_user_{tab_name}", value="")
+        st.text_input("Milvus Password", key=f"milvus_password_{tab_name}", value="", type="password")
+        st.checkbox("Secure Connection", key=f"milvus_secure_{tab_name}", value=False)
+    elif db_type == "lancedb":
+        st.text_input("LanceDB URI", key=f"lancedb_uri_{tab_name}", value="")
+    elif db_type == "meilisearch":
+        st.text_input("Meilisearch URL", key=f"meilisearch_url_{tab_name}", value="http://localhost:7700")
+        st.text_input("Meilisearch API Key", key=f"meilisearch_api_key_{tab_name}", value="", type="password")
+    elif db_type == "elasticsearch":
+        es_hosts = st.text_input("Elasticsearch Hosts (comma-separated)", key=f"es_hosts_{tab_name}", value="http://localhost:9200")
+        st.text_input("Elasticsearch API Key", key=f"es_api_key_{tab_name}", value="", type="password")
+        st.text_input("Elasticsearch Username", key=f"es_username_{tab_name}", value="")
+        st.text_input("Elasticsearch Password", key=f"es_password_{tab_name}", value="", type="password")
+    
+    # Collection name
+    collection_name = st.text_input("Collection Name", "documents", key=f"collection_name_{tab_name}")
+    
+    return db_type, host, port, storage_path, collection_name
+
+
 def get_search_query_from_llm(question):
     """Get search query from LLM using function calling"""
     provider = st.session_state.llm_provider
@@ -1165,6 +1470,7 @@ def initialize_session_state():
         st.session_state.total_results = 0
     if 'directories' not in st.session_state:
         st.session_state.directories = []
+    
     # Settings sections expanded state
     if 'connection_expanded' not in st.session_state:
         st.session_state.connection_expanded = True
@@ -1174,6 +1480,21 @@ def initialize_session_state():
         st.session_state.search_settings_expanded = False
     if 'advanced_expanded' not in st.session_state:
         st.session_state.advanced_expanded = False
+    
+    # Initialize embedding provider settings
+    if 'embedding_provider' not in st.session_state:
+        st.session_state.embedding_provider = "MLX"
+    if 'dense_model' not in st.session_state:
+        st.session_state.dense_model = DEFAULT_DENSE_MODEL
+    if 'sparse_model' not in st.session_state:
+        st.session_state.sparse_model = DEFAULT_SPARSE_MODEL
+    if 'ollama_model' not in st.session_state:
+        st.session_state.ollama_model = DEFAULT_OLLAMA_EMBED_MODEL
+    if 'fastembed_model' not in st.session_state:
+        st.session_state.fastembed_model = DEFAULT_FASTEMBED_MODEL
+    if 'fastembed_sparse_model' not in st.session_state:
+        st.session_state.fastembed_sparse_model = DEFAULT_FASTEMBED_SPARSE_MODEL
+        
     # LLM-specific session state variables
     if 'llm_provider' not in st.session_state:
         st.session_state.llm_provider = "Ollama"
@@ -1220,17 +1541,360 @@ def initialize_session_state():
     if 'chat_context' not in st.session_state:
         st.session_state.chat_context = ""
 
+def initialize_search():
+    """
+    Initialize search connection with consistent storage path handling.
+    
+    Returns:
+        Boolean indicating if initialization was successful
+    """
+    import streamlit as st
+    import os
+    
+    try:
+        # Close previous connection if exists
+        if 'db_manager' in st.session_state and st.session_state.db_manager:
+            try:
+                if hasattr(st.session_state.db_manager, 'client') and hasattr(st.session_state.db_manager.client, 'close'):
+                    st.session_state.db_manager.client.close()
+                del st.session_state.db_manager
+                st.session_state.db_manager = None
+                st.success("Closed previous connection.")
+            except Exception as e:
+                st.warning(f"Failed to close previous connection: {e}")
+        
+        # Get connection settings
+        connection_type = st.session_state.get("connection_type_search", "Local Storage")
+        db_type = st.session_state.get("db_type_search", "qdrant")
+        host = "localhost"
+        port = st.session_state.get("search_port_number", 6333)
+        collection_name = st.session_state.get("collection_name_search", "documents")
+        
+        # Get the appropriate storage path
+        if connection_type == "Local Storage":
+            # Use the get_storage_path function to get consistent path
+            storage_path = get_storage_path(db_type)
+            st.info(f"Using local storage at: {storage_path}")
+        else:
+            storage_path = None
+            host = st.session_state.get("host_search", "localhost")
+        
+        # Prepare database arguments
+        db_args = {
+            "collection_name": collection_name,
+            "storage_path": storage_path,
+            "verbose": st.session_state.show_debug
+        }
+        
+        # Add database-specific arguments based on type
+        if db_type == "qdrant":
+            db_args.update({
+                "host": host,
+                "port": port
+            })
+        elif db_type == "milvus":
+            db_args.update({
+                "host": host,
+                "port": port,
+                "user": st.session_state.get("milvus_user", ""),
+                "password": st.session_state.get("milvus_password", ""),
+                "secure": st.session_state.get("milvus_secure", False)
+            })
+        elif db_type == "lancedb":
+            db_args.update({
+                "uri": st.session_state.get("lancedb_uri", "")
+            })
+        elif db_type == "meilisearch":
+            db_args.update({
+                "url": st.session_state.get("meilisearch_url", "http://localhost:7700"),
+                "api_key": st.session_state.get("meilisearch_api_key", "")
+            })
+        elif db_type == "elasticsearch":
+            es_hosts_list = [h.strip() for h in st.session_state.get("es_hosts", "http://localhost:9200").split(",")]
+            db_args.update({
+                "hosts": es_hosts_list,
+                "api_key": st.session_state.get("es_api_key", ""),
+                "username": st.session_state.get("es_username", ""),
+                "password": st.session_state.get("es_password", "")
+            })
+        
+        # Create database manager
+        db_manager = gpu_safe_call(DBFactory.create_db, db_type, **db_args)
+        
+        # Use embedding provider from session state (already initialized)
+        embedding_provider = st.session_state.get("embedding_provider", "MLX")
+        
+        # Initialize processor based on embedding provider
+        processor_args = {
+            "model_name": "none",
+            "weights_path": None,
+            "verbose": st.session_state.show_debug
+        }
+        
+        if embedding_provider == "MLX":
+            processor_args.update({
+                "use_mlx_embedding": True,
+                "dense_model": st.session_state.get("dense_model", DEFAULT_DENSE_MODEL),
+                "sparse_model": st.session_state.get("sparse_model", DEFAULT_SPARSE_MODEL),
+                "custom_repo_id": st.session_state.get("custom_repo_id", "")
+            })
+        elif embedding_provider == "Ollama":
+            processor_args.update({
+                "use_ollama": True,
+                "ollama_model": st.session_state.get("ollama_model", DEFAULT_OLLAMA_EMBED_MODEL),
+                "ollama_host": st.session_state.get("ollama_host", "http://localhost:11434")
+            })
+        elif embedding_provider == "FastEmbed":
+            processor_args.update({
+                "use_fastembed": True,
+                "fastembed_model": st.session_state.get("fastembed_model", DEFAULT_FASTEMBED_MODEL),
+                "fastembed_sparse_model": st.session_state.get("fastembed_sparse_model", DEFAULT_FASTEMBED_SPARSE_MODEL)
+            })
+        
+        processor = gpu_safe_call(TextProcessor, **processor_args)
+        
+        # Update vector size in database manager if needed
+        vector_dim = processor.vector_size
+        if hasattr(db_manager, 'update_vector_size'):
+            db_manager.update_vector_size(vector_dim)
+        
+        # Update session state
+        st.session_state.db_manager = db_manager
+        st.session_state.processor = processor
+        st.session_state.search_initialized = True
+        
+        # Get collection info
+        try:
+            collection_info = db_manager.get_collection_info()
+            if isinstance(collection_info, dict) and "error" not in collection_info:
+                if "points_count" in collection_info:
+                    points_count = collection_info["points_count"]
+                    if points_count > 0:
+                        st.success(f"✅ Connected to collection '{collection_name}' with {points_count} points.")
+                    else:
+                        st.warning(f"Connected to collection '{collection_name}', but it's empty. Please index documents.")
+                else:
+                    st.success(f"✅ Connected to {db_type.capitalize()} successfully!")
+            else:
+                error_msg = collection_info.get("error", "Unknown error") if isinstance(collection_info, dict) else "Unknown error"
+                st.warning(f"Connected but couldn't get collection info: {error_msg}")
+        except Exception as e:
+            st.warning(f"Connected but couldn't get collection info: {e}")
+        
+        return True
+        
+    except Exception as e:
+        st.error(f"Error initializing search: {str(e)}")
+        if st.session_state.show_debug:
+            import traceback
+            st.error(traceback.format_exc())
+        return False
+
+def embedding_settings_section(tab_name):
+    """
+    Create a consistent embedding settings UI section that updates session state.
+    
+    Args:
+        tab_name: Name of the current tab for creating unique keys
+    """
+    import streamlit as st
+    
+    # Embedding provider selection
+    embedding_provider = st.radio("Embedding Provider", 
+                                 ["MLX", "Ollama", "FastEmbed"],
+                                 help="Select the embedding provider to use",
+                                 key=f"embedding_provider_{tab_name}")
+    
+    # Update the main session state embedding provider
+    st.session_state.embedding_provider = embedding_provider
+    
+    if embedding_provider == "MLX":
+        if HAS_MLX_EMBEDDING_MODELS:
+            # Get available models from registry
+            dense_models = [k for k, v in MLX_EMBEDDING_REGISTRY.items() if not v.get("lm_head")]
+            sparse_models = [k for k, v in MLX_EMBEDDING_REGISTRY.items() if v.get("lm_head")]
+            
+            if dense_models:
+                dense_model = st.selectbox(
+                    "Dense Model", 
+                    dense_models,
+                    index=dense_models.index(DEFAULT_DENSE_MODEL) if DEFAULT_DENSE_MODEL in dense_models else 0,
+                    key=f"dense_model_{tab_name}"
+                )
+            else:
+                dense_model = st.text_input("Dense Model", DEFAULT_DENSE_MODEL, key=f"dense_model_input_{tab_name}")
+            
+            # Update the session state
+            st.session_state.dense_model = dense_model
+            
+            if sparse_models:
+                sparse_model = st.selectbox(
+                    "Sparse Model",
+                    sparse_models,
+                    index=sparse_models.index(DEFAULT_SPARSE_MODEL) if DEFAULT_SPARSE_MODEL in sparse_models else 0,
+                    key=f"sparse_model_{tab_name}"
+                )
+            else:
+                sparse_model = st.text_input("Sparse Model", DEFAULT_SPARSE_MODEL, key=f"sparse_model_input_{tab_name}")
+            
+            # Update the session state
+            st.session_state.sparse_model = sparse_model
+            
+            custom_repo_id = st.text_input(
+                "Custom Repo ID", 
+                "",
+                help="Optional: Specify a custom HuggingFace repository",
+                key=f"custom_repo_id_{tab_name}"
+            )
+            st.session_state.custom_repo_id = custom_repo_id
+            
+            # Advanced MLX settings in expander
+            with st.expander("Advanced MLX Settings"):
+                top_k = st.number_input("Top-k tokens (SPLADE)", value=64, min_value=1, max_value=512, key=f"top_k_{tab_name}")
+                st.session_state.top_k = top_k
+                
+                custom_ndim = st.number_input("Custom Dimension", value=0, min_value=0, max_value=4096, key=f"custom_ndim_{tab_name}")
+                st.session_state.custom_ndim = custom_ndim
+                
+                custom_pooling = st.selectbox("Pooling Method", ["mean", "first", "max"], key=f"custom_pooling_{tab_name}")
+                st.session_state.custom_pooling = custom_pooling
+                
+                custom_normalize = st.checkbox("Normalize Embeddings", value=True, key=f"custom_normalize_{tab_name}")
+                st.session_state.custom_normalize = custom_normalize
+                
+                custom_max_length = st.number_input("Max Sequence Length", value=512, min_value=64, max_value=2048, key=f"custom_max_length_{tab_name}")
+                st.session_state.custom_max_length = custom_max_length
+        else:
+            st.warning("MLX Embedding Models not available. You need to install mlx-embedding-models.")
+            dense_model = DEFAULT_DENSE_MODEL
+            sparse_model = DEFAULT_SPARSE_MODEL
+            custom_repo_id = ""
+            top_k = 64
+            
+            # Update the session state anyway
+            st.session_state.dense_model = dense_model
+            st.session_state.sparse_model = sparse_model
+            st.session_state.custom_repo_id = custom_repo_id
+            st.session_state.top_k = top_k
+    
+    elif embedding_provider == "Ollama":
+        if HAS_OLLAMA:
+            if OLLAMA_MODELS_REGISTRY:
+                ollama_models = list(OLLAMA_MODELS_REGISTRY.keys())
+                ollama_model = st.selectbox(
+                    "Ollama Model",
+                    ollama_models,
+                    index=ollama_models.index(DEFAULT_OLLAMA_EMBED_MODEL) if DEFAULT_OLLAMA_EMBED_MODEL in ollama_models else 0,
+                    key=f"ollama_model_{tab_name}"
+                )
+            else:
+                ollama_model = st.text_input("Ollama Model", DEFAULT_OLLAMA_EMBED_MODEL, key=f"ollama_model_input_{tab_name}")
+            
+            st.session_state.ollama_model = ollama_model
+            ollama_host = st.text_input("Ollama Host", "http://localhost:11434", key=f"ollama_host_{tab_name}")
+            st.session_state.ollama_host = ollama_host
+        else:
+            st.warning("Ollama not available. Make sure Ollama is installed and running.")
+            ollama_model = DEFAULT_OLLAMA_EMBED_MODEL
+            ollama_host = "http://localhost:11434"
+            
+            # Update the session state anyway
+            st.session_state.ollama_model = ollama_model
+            st.session_state.ollama_host = ollama_host
+    
+    elif embedding_provider == "FastEmbed":
+        if HAS_FASTEMBED:
+            if FASTEMBED_MODELS_REGISTRY:
+                # Filter models by type
+                fastembed_dense_models = [k for k, v in FASTEMBED_MODELS_REGISTRY.items() 
+                                        if v.get("ndim", 0) > 0]
+                fastembed_sparse_models = [k for k, v in FASTEMBED_MODELS_REGISTRY.items() 
+                                        if v.get("ndim", 1) == 0]
+                
+                if fastembed_dense_models:
+                    fastembed_model = st.selectbox(
+                        "FastEmbed Dense Model",
+                        fastembed_dense_models,
+                        index=fastembed_dense_models.index(DEFAULT_FASTEMBED_MODEL) if DEFAULT_FASTEMBED_MODEL in fastembed_dense_models else 0,
+                        key=f"fastembed_model_{tab_name}"
+                    )
+                else:
+                    fastembed_model = st.text_input("FastEmbed Dense Model", DEFAULT_FASTEMBED_MODEL, key=f"fastembed_model_input_{tab_name}")
+                
+                if fastembed_sparse_models:
+                    fastembed_sparse_model = st.selectbox(
+                        "FastEmbed Sparse Model",
+                        fastembed_sparse_models,
+                        index=fastembed_sparse_models.index(DEFAULT_FASTEMBED_SPARSE_MODEL) if DEFAULT_FASTEMBED_SPARSE_MODEL in fastembed_sparse_models else 0,
+                        key=f"fastembed_sparse_model_{tab_name}"
+                    )
+                else:
+                    fastembed_sparse_model = st.text_input("FastEmbed Sparse Model", DEFAULT_FASTEMBED_SPARSE_MODEL, key=f"fastembed_sparse_model_input_{tab_name}")
+            else:
+                fastembed_model = st.text_input("FastEmbed Dense Model", DEFAULT_FASTEMBED_MODEL, key=f"fastembed_model_input_{tab_name}")
+                fastembed_sparse_model = st.text_input("FastEmbed Sparse Model", DEFAULT_FASTEMBED_SPARSE_MODEL, key=f"fastembed_sparse_model_input_{tab_name}")
+                
+            # Update the session state
+            st.session_state.fastembed_model = fastembed_model
+            st.session_state.fastembed_sparse_model = fastembed_sparse_model
+            
+            fastembed_use_gpu = st.checkbox("Use GPU (requires fastembed-gpu)", value=False, key=f"fastembed_use_gpu_{tab_name}")
+            st.session_state.fastembed_use_gpu = fastembed_use_gpu
+            
+            fastembed_cache_dir = st.text_input("Model Cache Directory", "", key=f"fastembed_cache_dir_{tab_name}")
+            st.session_state.fastembed_cache_dir = fastembed_cache_dir
+        else:
+            st.warning("FastEmbed not available. You need to install fastembed.")
+            fastembed_model = DEFAULT_FASTEMBED_MODEL
+            fastembed_sparse_model = DEFAULT_FASTEMBED_SPARSE_MODEL
+            fastembed_use_gpu = False
+            fastembed_cache_dir = ""
+            
+            # Update the session state anyway
+            st.session_state.fastembed_model = fastembed_model
+            st.session_state.fastembed_sparse_model = fastembed_sparse_model
+            st.session_state.fastembed_use_gpu = fastembed_use_gpu
+            st.session_state.fastembed_cache_dir = fastembed_cache_dir
 
 # Expandable section component
 def expandable_section(title, key, default=False, icon=""):
+    """
+    Create an expandable section with a unique key for each tab/context.
+    
+    Args:
+        title: The title text for the section
+        key: Base key for the section
+        default: Default expanded state
+        icon: Icon to display before the title
+        
+    Returns:
+        Boolean indicating if the section is expanded
+    """
     # Determine if this section is expanded
     if key not in st.session_state:
         st.session_state[key] = default
     
+    # Add a unique identifier to the key based on the caller's location in the code
+    # This ensures even multiple calls from the same tab get unique keys
+    import inspect
+    import hashlib
+    
+    # Get the caller's frame
+    frame = inspect.currentframe().f_back
+    
+    # Create a unique identifier based on the caller's filename, line number, and code context
+    caller_info = f"{frame.f_code.co_filename}:{frame.f_lineno}"
+    
+    # Generate a short hash of the caller_info to make the key shorter
+    caller_hash = hashlib.md5(caller_info.encode()).hexdigest()[:6]
+    
+    # Create a unique button key
+    unique_key = f"{key}_{caller_hash}_{title.replace(' ', '_')}"
+    
     # Create the expandable header
     clicked = st.button(
         f"{icon} {title} {'▼' if st.session_state[key] else '▶'}",
-        key=f"btn_{key}",
+        key=unique_key,
         help=f"Click to {'collapse' if st.session_state[key] else 'expand'} this section"
     )
     
@@ -1258,163 +1922,31 @@ with tab1:
         
         # Connection settings
         if expandable_section("Connection Settings", "connection_expanded", True, "🔌"):
-            connection_type = st.radio("Connection Type", ["Local Storage", "Remote Server"])
-            
-            if connection_type == "Local Storage":
-                host = "localhost"
-                port = 6333
-                storage_path = os.path.join(os.getcwd(), "mlxrag_storage")
-                st.info(f"Using local storage at: {storage_path}")
-            else:
-                host = st.text_input("Host", "localhost")
-                port = st.number_input("Port", value=6333, min_value=1, max_value=65535)
-                storage_path = None
-            
-            # Database selection
-            db_type = st.selectbox(
-                "Database Backend", 
-                ["qdrant", "milvus", "lancedb", "meilisearch", "elasticsearch", "chromadb"],
-                help="Select the vector database backend to use"
+            # Use the new handle_connection_settings function
+            # First get the connection type
+            connection_type = st.radio(
+                "Connection Type", 
+                ["Local Storage", "Remote Server"],
+                key=f"connection_type_index"
             )
             
-            # Add specific database settings based on selection
-            if db_type == "milvus":
-                st.text_input("Milvus User", key="milvus_user", value="")
-                st.text_input("Milvus Password", key="milvus_password", value="", type="password")
-                st.checkbox("Secure Connection", key="milvus_secure", value=False)
-            elif db_type == "lancedb":
-                st.text_input("LanceDB URI", key="lancedb_uri", value="")
-            elif db_type == "meilisearch":
-                st.text_input("Meilisearch URL", key="meilisearch_url", value="http://localhost:7700")
-                st.text_input("Meilisearch API Key", key="meilisearch_api_key", value="", type="password")
-            elif db_type == "elasticsearch":
-                es_hosts = st.text_input("Elasticsearch Hosts (comma-separated)", key="es_hosts", value="http://localhost:9200")
-                st.text_input("Elasticsearch API Key", key="es_api_key", value="", type="password")
-                st.text_input("Elasticsearch Username", key="es_username", value="")
-                st.text_input("Elasticsearch Password", key="es_password", value="", type="password")
-            
-            # Collection name
-            collection_name = st.text_input("Collection Name", "documents")
-            recreate_collection = st.checkbox("Recreate Collection if Exists")
+            # Then use the handle_connection_settings function which will use the same radio button
+            db_type, host, port, storage_path, collection_name = handle_connection_settings("index")
+            recreate_collection = st.checkbox("Recreate Collection if Exists", key="recreate_collection")
             
         # Embedding model settings
         if expandable_section("Embedding Settings", "embedding_expanded", False, "🧠"):
-            # Embedding provider selection
-            embedding_provider = st.radio(
-                "Embedding Provider",
-                ["MLX", "Ollama", "FastEmbed"], 
-                help="Select the embedding provider to use"
-            )
-            
-            if embedding_provider == "MLX":
-                if HAS_MLX_EMBEDDING_MODELS:
-                    # Get available models from registry
-                    dense_models = [k for k, v in MLX_EMBEDDING_REGISTRY.items() if not v.get("lm_head")]
-                    sparse_models = [k for k, v in MLX_EMBEDDING_REGISTRY.items() if v.get("lm_head")]
-                    
-                    if dense_models:
-                        dense_model = st.selectbox(
-                            "Dense Model", 
-                            dense_models,
-                            index=dense_models.index(DEFAULT_DENSE_MODEL) if DEFAULT_DENSE_MODEL in dense_models else 0
-                        )
-                    else:
-                        dense_model = st.text_input("Dense Model", DEFAULT_DENSE_MODEL)
-                    
-                    if sparse_models:
-                        sparse_model = st.selectbox(
-                            "Sparse Model",
-                            sparse_models,
-                            index=sparse_models.index(DEFAULT_SPARSE_MODEL) if DEFAULT_SPARSE_MODEL in sparse_models else 0
-                        )
-                    else:
-                        sparse_model = st.text_input("Sparse Model", DEFAULT_SPARSE_MODEL)
-                    
-                    custom_repo_id = st.text_input(
-                        "Custom Repo ID", 
-                        "",
-                        help="Optional: Specify a custom HuggingFace repository"
-                    )
-                    
-                    # Advanced MLX settings in expander
-                    with st.expander("Advanced MLX Settings"):
-                        top_k = st.number_input("Top-k tokens (SPLADE)", value=64, min_value=1, max_value=512)
-                        custom_ndim = st.number_input("Custom Dimension", value=0, min_value=0, max_value=4096)
-                        custom_pooling = st.selectbox("Pooling Method", ["mean", "first", "max"])
-                        custom_normalize = st.checkbox("Normalize Embeddings", value=True)
-                        custom_max_length = st.number_input("Max Sequence Length", value=512, min_value=64, max_value=2048)
-                else:
-                    st.warning("MLX Embedding Models not available. You need to install mlx-embedding-models.")
-                    dense_model = DEFAULT_DENSE_MODEL
-                    sparse_model = DEFAULT_SPARSE_MODEL
-                    custom_repo_id = ""
-                    top_k = 64
-            
-            elif embedding_provider == "Ollama":
-                if HAS_OLLAMA:
-                    if OLLAMA_MODELS_REGISTRY:
-                        ollama_models = list(OLLAMA_MODELS_REGISTRY.keys())
-                        ollama_model = st.selectbox(
-                            "Ollama Model",
-                            ollama_models,
-                            index=ollama_models.index(DEFAULT_OLLAMA_EMBED_MODEL) if DEFAULT_OLLAMA_EMBED_MODEL in ollama_models else 0
-                        )
-                    else:
-                        ollama_model = st.text_input("Ollama Model", DEFAULT_OLLAMA_EMBED_MODEL)
-                    
-                    ollama_host = st.text_input("Ollama Host", "http://localhost:11434")
-                else:
-                    st.warning("Ollama not available. Make sure Ollama is installed and running.")
-                    ollama_model = DEFAULT_OLLAMA_EMBED_MODEL
-                    ollama_host = "http://localhost:11434"
-            
-            elif embedding_provider == "FastEmbed":
-                if HAS_FASTEMBED:
-                    if FASTEMBED_MODELS_REGISTRY:
-                        # Filter models by type
-                        fastembed_dense_models = [k for k, v in FASTEMBED_MODELS_REGISTRY.items() 
-                                                if v.get("ndim", 0) > 0]
-                        fastembed_sparse_models = [k for k, v in FASTEMBED_MODELS_REGISTRY.items() 
-                                                if v.get("ndim", 1) == 0]
-                        
-                        if fastembed_dense_models:
-                            fastembed_model = st.selectbox(
-                                "FastEmbed Dense Model",
-                                fastembed_dense_models,
-                                index=fastembed_dense_models.index(DEFAULT_FASTEMBED_MODEL) if DEFAULT_FASTEMBED_MODEL in fastembed_dense_models else 0
-                            )
-                        else:
-                            fastembed_model = st.text_input("FastEmbed Dense Model", DEFAULT_FASTEMBED_MODEL)
-                        
-                        if fastembed_sparse_models:
-                            fastembed_sparse_model = st.selectbox(
-                                "FastEmbed Sparse Model",
-                                fastembed_sparse_models,
-                                index=fastembed_sparse_models.index(DEFAULT_FASTEMBED_SPARSE_MODEL) if DEFAULT_FASTEMBED_SPARSE_MODEL in fastembed_sparse_models else 0
-                            )
-                        else:
-                            fastembed_sparse_model = st.text_input("FastEmbed Sparse Model", DEFAULT_FASTEMBED_SPARSE_MODEL)
-                    else:
-                        fastembed_model = st.text_input("FastEmbed Dense Model", DEFAULT_FASTEMBED_MODEL)
-                        fastembed_sparse_model = st.text_input("FastEmbed Sparse Model", DEFAULT_FASTEMBED_SPARSE_MODEL)
-                        
-                    fastembed_use_gpu = st.checkbox("Use GPU (requires fastembed-gpu)", value=False)
-                    fastembed_cache_dir = st.text_input("Model Cache Directory", "")
-                else:
-                    st.warning("FastEmbed not available. You need to install fastembed.")
-                    fastembed_model = DEFAULT_FASTEMBED_MODEL
-                    fastembed_sparse_model = DEFAULT_FASTEMBED_SPARSE_MODEL
-                    fastembed_use_gpu = False
-                    fastembed_cache_dir = ""
+            # Use the new embedding_settings_section function
+            embedding_settings_section("search")
         
         # Advanced settings
         if expandable_section("Advanced Settings", "advanced_expanded", False, "⚙️"):
-            st.session_state.show_debug = st.checkbox("Show Debug Info", False)
-            max_docs = st.number_input("Max Documents to Index", min_value=1, max_value=10000, value=100)
+            st.session_state.show_debug = st.checkbox("Show Debug Info", False, key="show_debug_index")
+            max_docs = st.number_input("Max Documents to Index", min_value=1, max_value=10000, value=100, key="max_docs_index")
             
             # Storage management
             if connection_type == "Local Storage":
-                if st.button("Clear Storage"):
+                if st.button("Clear Storage", key="clear_storage_btn"):
                     try:
                         # Create directory path
                         collections_dir = os.path.join(storage_path, "collections")
@@ -1428,7 +1960,7 @@ with tab1:
                     except Exception as e:
                         st.error(f"Error clearing storage: {e}")
                 
-                if st.button("Force Close Database Connection"):
+                if st.button("Force Close Database Connection", key="force_close_db_btn"):
                     try:
                         if 'db_manager' in st.session_state and st.session_state.db_manager:
                             if hasattr(st.session_state.db_manager, 'client') and hasattr(st.session_state.db_manager.client, 'close'):
@@ -1439,7 +1971,7 @@ with tab1:
                             st.session_state.search_initialized = False
                     except Exception as e:
                         st.error(f"Failed to close database connection: {e}")
-    
+
     # Check connection button
     if st.button("Check Connection"):
         try:
@@ -1527,7 +2059,7 @@ with tab1:
                 st.error(traceback.format_exc())
     
     # File upload option
-    upload_option = st.radio("Upload Method", ["Upload Files", "Specify Directory"])
+    upload_option = st.radio("Upload Method", ["Upload Files", "Specify Directory"], key="upload_method_radio")
     
     if upload_option == "Upload Files":
         uploaded_files = st.file_uploader("Upload documents", 
@@ -1623,6 +2155,23 @@ with tab1:
                         "weights_path": None,
                         "verbose": st.session_state.show_debug
                     }
+
+                    # Get embedding model parameters from session state with defaults
+                    dense_model = st.session_state.get("dense_model", DEFAULT_DENSE_MODEL)
+                    sparse_model = st.session_state.get("sparse_model", DEFAULT_SPARSE_MODEL)
+                    ollama_model = st.session_state.get("ollama_model", DEFAULT_OLLAMA_EMBED_MODEL)
+                    fastembed_model = st.session_state.get("fastembed_model", DEFAULT_FASTEMBED_MODEL)
+                    fastembed_sparse_model = st.session_state.get("fastembed_sparse_model", DEFAULT_FASTEMBED_SPARSE_MODEL)
+                    custom_repo_id = st.session_state.get("custom_repo_id", "")
+                    top_k = st.session_state.get("top_k", 64)
+                    custom_ndim = st.session_state.get("custom_ndim", 0)
+                    custom_pooling = st.session_state.get("custom_pooling", "mean")
+                    custom_normalize = st.session_state.get("custom_normalize", True)
+                    custom_max_length = st.session_state.get("custom_max_length", 512)
+                    ollama_host = st.session_state.get("ollama_host", "http://localhost:11434")
+                    fastembed_use_gpu = st.session_state.get("fastembed_use_gpu", False)
+                    fastembed_cache_dir = st.session_state.get("fastembed_cache_dir", "")
+                    embedding_provider = st.session_state.get("embedding_provider", "MLX")
                     
                     if embedding_provider == "MLX":
                         processor_args.update({
@@ -1664,6 +2213,24 @@ with tab1:
                     total_chunks = 0
                     successful_files = 0
                     
+
+                    # Get embedding model parameters from session state with defaults
+                    dense_model = st.session_state.get("dense_model", DEFAULT_DENSE_MODEL)
+                    sparse_model = st.session_state.get("sparse_model", DEFAULT_SPARSE_MODEL)
+                    ollama_model = st.session_state.get("ollama_model", DEFAULT_OLLAMA_EMBED_MODEL)
+                    fastembed_model = st.session_state.get("fastembed_model", DEFAULT_FASTEMBED_MODEL)
+                    fastembed_sparse_model = st.session_state.get("fastembed_sparse_model", DEFAULT_FASTEMBED_SPARSE_MODEL)
+                    custom_repo_id = st.session_state.get("custom_repo_id", "")
+                    top_k = st.session_state.get("top_k", 64)
+                    custom_ndim = st.session_state.get("custom_ndim", 0)
+                    custom_pooling = st.session_state.get("custom_pooling", "mean")
+                    custom_normalize = st.session_state.get("custom_normalize", True)
+                    custom_max_length = st.session_state.get("custom_max_length", 512)
+                    ollama_host = st.session_state.get("ollama_host", "http://localhost:11434")
+                    fastembed_use_gpu = st.session_state.get("fastembed_use_gpu", False)
+                    fastembed_cache_dir = st.session_state.get("fastembed_cache_dir", "")
+                    embedding_provider = st.session_state.get("embedding_provider", "MLX")
+
                     for i, file_path in enumerate(saved_files):
                         progress = 0.5 + (i + 1) / (len(saved_files) * 2)  # Second half for indexing
                         progress_bar.progress(progress)
@@ -1836,6 +2403,23 @@ with tab1:
                             "verbose": st.session_state.show_debug
                         }
                         
+                        # Get embedding model parameters from session state with defaults
+                        dense_model = st.session_state.get("dense_model", DEFAULT_DENSE_MODEL)
+                        sparse_model = st.session_state.get("sparse_model", DEFAULT_SPARSE_MODEL)
+                        ollama_model = st.session_state.get("ollama_model", DEFAULT_OLLAMA_EMBED_MODEL)
+                        fastembed_model = st.session_state.get("fastembed_model", DEFAULT_FASTEMBED_MODEL)
+                        fastembed_sparse_model = st.session_state.get("fastembed_sparse_model", DEFAULT_FASTEMBED_SPARSE_MODEL)
+                        custom_repo_id = st.session_state.get("custom_repo_id", "")
+                        top_k = st.session_state.get("top_k", 64)
+                        custom_ndim = st.session_state.get("custom_ndim", 0)
+                        custom_pooling = st.session_state.get("custom_pooling", "mean")
+                        custom_normalize = st.session_state.get("custom_normalize", True)
+                        custom_max_length = st.session_state.get("custom_max_length", 512)
+                        ollama_host = st.session_state.get("ollama_host", "http://localhost:11434")
+                        fastembed_use_gpu = st.session_state.get("fastembed_use_gpu", False)
+                        fastembed_cache_dir = st.session_state.get("fastembed_cache_dir", "")
+                        embedding_provider = st.session_state.get("embedding_provider", "MLX")
+
                         if embedding_provider == "MLX":
                             processor_args.update({
                                 "use_mlx_embedding": True,
@@ -1930,43 +2514,8 @@ with tab2:
         
         # Search configuration with expandable sections
         if expandable_section("Connection Settings", "connection_expanded", True, "🔌"):
-            connection_type = st.radio("Connection Type", ["Local Storage", "Remote Server"])
-            
-            if connection_type == "Local Storage":
-                host = "localhost"
-                port = 6333
-                storage_path = os.path.join(os.getcwd(), "mlxrag_storage")
-                st.info(f"Using local storage at: {storage_path}")
-            else:
-                host = st.text_input("Host", "localhost")
-                port = st.number_input("Port", value=6333, min_value=1, max_value=65535)
-                storage_path = None
-            
-            # Database selection
-            db_type = st.selectbox(
-                "Database Backend", 
-                ["qdrant", "milvus", "lancedb", "meilisearch", "elasticsearch", "chromadb"],
-                help="Select the vector database backend to use"
-            )
-            
-            # Add specific database settings based on selection
-            if db_type == "milvus":
-                st.text_input("Milvus User", key="milvus_user", value="")
-                st.text_input("Milvus Password", key="milvus_password", value="", type="password")
-                st.checkbox("Secure Connection", key="milvus_secure", value=False)
-            elif db_type == "lancedb":
-                st.text_input("LanceDB URI", key="lancedb_uri", value="")
-            elif db_type == "meilisearch":
-                st.text_input("Meilisearch URL", key="meilisearch_url", value="http://localhost:7700")
-                st.text_input("Meilisearch API Key", key="meilisearch_api_key", value="", type="password")
-            elif db_type == "elasticsearch":
-                es_hosts = st.text_input("Elasticsearch Hosts (comma-separated)", key="es_hosts", value="http://localhost:9200")
-                st.text_input("Elasticsearch API Key", key="es_api_key", value="", type="password")
-                st.text_input("Elasticsearch Username", key="es_username", value="")
-                st.text_input("Elasticsearch Password", key="es_password", value="", type="password")
-            
-            # Collection name
-            collection_name = st.text_input("Collection Name", "documents")
+            # Use the new handle_connection_settings function
+            db_type, host, port, storage_path, collection_name = handle_connection_settings("search")
         
         # Embedding provider settings
         if expandable_section("Embedding Settings", "embedding_expanded", False, "🧠"):
@@ -1974,7 +2523,8 @@ with tab2:
             embedding_provider = st.radio(
                 "Embedding Provider",
                 ["MLX", "Ollama", "FastEmbed"], 
-                help="Select the embedding provider to use"
+                help="Select the embedding provider to use",
+                key = "embedding_provider_search_radio"
             )
             
             if embedding_provider == "MLX":
@@ -1987,7 +2537,8 @@ with tab2:
                         dense_model = st.selectbox(
                             "Dense Model", 
                             dense_models,
-                            index=dense_models.index(DEFAULT_DENSE_MODEL) if DEFAULT_DENSE_MODEL in dense_models else 0
+                            index=dense_models.index(DEFAULT_DENSE_MODEL) if DEFAULT_DENSE_MODEL in dense_models else 0,
+                            key = "mlx_dense_model_selection"
                         )
                     else:
                         dense_model = st.text_input("Dense Model", DEFAULT_DENSE_MODEL)
@@ -1996,7 +2547,8 @@ with tab2:
                         sparse_model = st.selectbox(
                             "Sparse Model",
                             sparse_models,
-                            index=sparse_models.index(DEFAULT_SPARSE_MODEL) if DEFAULT_SPARSE_MODEL in sparse_models else 0
+                            index=sparse_models.index(DEFAULT_SPARSE_MODEL) if DEFAULT_SPARSE_MODEL in sparse_models else 0,
+                            key = "mlx_sparse_model_selection"
                         )
                     else:
                         sparse_model = st.text_input("Sparse Model", DEFAULT_SPARSE_MODEL)
@@ -2004,7 +2556,8 @@ with tab2:
                     custom_repo_id = st.text_input(
                         "Custom Repo ID", 
                         "",
-                        help="Optional: Specify a custom HuggingFace repository"
+                        help="Optional: Specify a custom HuggingFace repository",
+                        key = "custom_repo_id"
                     )
                 else:
                     st.warning("MLX Embedding Models not available.")
@@ -2019,12 +2572,13 @@ with tab2:
                         ollama_model = st.selectbox(
                             "Ollama Model",
                             ollama_models,
-                            index=ollama_models.index(DEFAULT_OLLAMA_EMBED_MODEL) if DEFAULT_OLLAMA_EMBED_MODEL in ollama_models else 0
+                            index=ollama_models.index(DEFAULT_OLLAMA_EMBED_MODEL) if DEFAULT_OLLAMA_EMBED_MODEL in ollama_models else 0,
+                            key = "ollama_model_selection"
                         )
                     else:
                         ollama_model = st.text_input("Ollama Model", DEFAULT_OLLAMA_EMBED_MODEL)
                     
-                    ollama_host = st.text_input("Ollama Host", "http://localhost:11434")
+                    ollama_host = st.text_input("Ollama Host", "http://localhost:11434", key = "ollama_host")
                 else:
                     st.warning("Ollama not available.")
                     ollama_model = DEFAULT_OLLAMA_EMBED_MODEL
@@ -2043,7 +2597,8 @@ with tab2:
                             fastembed_model = st.selectbox(
                                 "FastEmbed Dense Model",
                                 fastembed_dense_models,
-                                index=fastembed_dense_models.index(DEFAULT_FASTEMBED_MODEL) if DEFAULT_FASTEMBED_MODEL in fastembed_dense_models else 0
+                                index=fastembed_dense_models.index(DEFAULT_FASTEMBED_MODEL) if DEFAULT_FASTEMBED_MODEL in fastembed_dense_models else 0,
+                                key = "fastembed_dense_model_selection"
                             )
                         else:
                             fastembed_model = st.text_input("FastEmbed Dense Model", DEFAULT_FASTEMBED_MODEL)
@@ -2052,7 +2607,8 @@ with tab2:
                             fastembed_sparse_model = st.selectbox(
                                 "FastEmbed Sparse Model",
                                 fastembed_sparse_models,
-                                index=fastembed_sparse_models.index(DEFAULT_FASTEMBED_SPARSE_MODEL) if DEFAULT_FASTEMBED_SPARSE_MODEL in fastembed_sparse_models else 0
+                                index=fastembed_sparse_models.index(DEFAULT_FASTEMBED_SPARSE_MODEL) if DEFAULT_FASTEMBED_SPARSE_MODEL in fastembed_sparse_models else 0,
+                                key = "fastembed_sparse_model_selection"
                             )
                         else:
                             fastembed_sparse_model = st.text_input("FastEmbed Sparse Model", DEFAULT_FASTEMBED_SPARSE_MODEL)
@@ -2066,144 +2622,29 @@ with tab2:
         
         # Search settings section
         if expandable_section("Search Settings", "search_settings_expanded", True, "🔍"):
-            st.session_state.search_limit = st.number_input("Results Per Page", 5, 50, 10)
-            max_results = st.number_input("Max Total Results", 10, 1000, 100)
-            st.session_state.context_size = st.number_input("Context Size", 200, 2000, 500)
-            prefetch_limit = st.number_input("Prefetch Limit for Hybrid Search", 10, 200, 50)
-            fusion_type = st.selectbox("Fusion Strategy", ["rrf", "dbsf", "linear"])
-            rerank = st.checkbox("Apply Reranking", True)
-            reranker_type = st.selectbox("Reranker Type", ["cross", "colbert", "cohere", "jina", "rrf", "linear"], 0)
-            sort_by_score = st.checkbox("Sort Results by Score", value=True)
-            score_threshold = st.slider("Score Threshold", 0.0, 1.0, 0.0, 0.01)
+            st.session_state.search_limit = st.number_input("Results Per Page", 5, 50, 10, key="results_per_page")
+            max_results = st.number_input("Max Total Results", 10, 1000, 100, key="max_total_results")
+            st.session_state.context_size = st.number_input("Context Size", 200, 2000, 500, key="context_size_input")
+            prefetch_limit = st.number_input("Prefetch Limit for Hybrid Search", 10, 200, 50, key="prefetch_limit")
+            fusion_type = st.selectbox("Fusion Strategy", ["rrf", "dbsf", "linear"], key="fusion_type_selection")
+            rerank = st.checkbox("Apply Reranking", True, key="apply_rerank")
+            reranker_type = st.selectbox("Reranker Type", ["cross", "colbert", "cohere", "jina", "rrf", "linear"], 0, key="reranker_type_selection")
+            sort_by_score = st.checkbox("Sort Results by Score", value=True, key="sort_by_score")
+            score_threshold = st.slider("Score Threshold", 0.0, 1.0, 0.0, 0.01, key="score_threshold")
         
         # Advanced settings
         if expandable_section("Advanced Settings", "advanced_expanded", False, "⚙️"):
-            st.session_state.show_debug = st.checkbox("Show Debug Info", False)
+            st.session_state.show_debug = st.checkbox("Show Debug Info", False, key="show_debug_search")
     
     # Initialize search connection UI
     if not st.session_state.search_initialized:
         st.info("No active search connection. Please initialize search to continue.")
         
         if st.button("Initialize Search"):
-            try:
-                # Close previous connection if exists
-                if 'db_manager' in st.session_state and st.session_state.db_manager:
-                    try:
-                        if hasattr(st.session_state.db_manager, 'client') and hasattr(st.session_state.db_manager.client, 'close'):
-                            st.session_state.db_manager.client.close()
-                        del st.session_state.db_manager
-                        st.session_state.db_manager = None
-                        st.success("Closed previous connection.")
-                    except Exception as e:
-                        st.warning(f"Failed to close previous connection: {e}")
-                
-                # Prepare database arguments
-                db_args = {
-                    "collection_name": collection_name,
-                    "storage_path": storage_path if connection_type == "Local Storage" else None,
-                    "verbose": st.session_state.show_debug
-                }
-                
-                # Add database-specific arguments based on type
-                if db_type == "qdrant":
-                    db_args.update({
-                        "host": host,
-                        "port": port
-                    })
-                elif db_type == "milvus":
-                    db_args.update({
-                        "host": host,
-                        "port": port,
-                        "user": st.session_state.get("milvus_user", ""),
-                        "password": st.session_state.get("milvus_password", ""),
-                        "secure": st.session_state.get("milvus_secure", False)
-                    })
-                elif db_type == "lancedb":
-                    db_args.update({
-                        "uri": st.session_state.get("lancedb_uri", "")
-                    })
-                elif db_type == "meilisearch":
-                    db_args.update({
-                        "url": st.session_state.get("meilisearch_url", "http://localhost:7700"),
-                        "api_key": st.session_state.get("meilisearch_api_key", "")
-                    })
-                elif db_type == "elasticsearch":
-                    es_hosts_list = [h.strip() for h in st.session_state.get("es_hosts", "http://localhost:9200").split(",")]
-                    db_args.update({
-                        "hosts": es_hosts_list,
-                        "api_key": st.session_state.get("es_api_key", ""),
-                        "username": st.session_state.get("es_username", ""),
-                        "password": st.session_state.get("es_password", "")
-                    })
-                
-                # Create database manager
-                db_manager = gpu_safe_call(DBFactory.create_db, db_type, **db_args)
-                
-                # Initialize processor based on embedding provider
-                processor_args = {
-                    "model_name": "none",
-                    "weights_path": None,
-                    "verbose": st.session_state.show_debug
-                }
-                
-                if embedding_provider == "MLX":
-                    processor_args.update({
-                        "use_mlx_embedding": True,
-                        "dense_model": dense_model,
-                        "sparse_model": sparse_model,
-                        "custom_repo_id": custom_repo_id if custom_repo_id else None
-                    })
-                elif embedding_provider == "Ollama":
-                    processor_args.update({
-                        "use_ollama": True,
-                        "ollama_model": ollama_model,
-                        "ollama_host": ollama_host
-                    })
-                elif embedding_provider == "FastEmbed":
-                    processor_args.update({
-                        "use_fastembed": True,
-                        "fastembed_model": fastembed_model,
-                        "fastembed_sparse_model": fastembed_sparse_model
-                    })
-                
-                processor = gpu_safe_call(TextProcessor, **processor_args)
-                
-                # Update vector size in database manager if needed
-                vector_dim = processor.vector_size
-                if hasattr(db_manager, 'update_vector_size'):
-                    db_manager.update_vector_size(vector_dim)
-                
-                # Update session state
-                st.session_state.db_manager = db_manager
-                st.session_state.processor = processor
-                st.session_state.search_initialized = True
-                
-                # Get collection info
-                try:
-                    collection_info = db_manager.get_collection_info()
-                    if isinstance(collection_info, dict) and "error" not in collection_info:
-                        if "points_count" in collection_info:
-                            points_count = collection_info["points_count"]
-                            if points_count > 0:
-                                st.success(f"✅ Connected to collection '{collection_name}' with {points_count} points.")
-                            else:
-                                st.warning(f"Connected to collection '{collection_name}', but it's empty. Please index documents.")
-                        else:
-                            st.success(f"✅ Connected to {db_type.capitalize()} successfully!")
-                    else:
-                        error_msg = collection_info.get("error", "Unknown error") if isinstance(collection_info, dict) else "Unknown error"
-                        st.warning(f"Connected but couldn't get collection info: {error_msg}")
-                except Exception as e:
-                    st.warning(f"Connected but couldn't get collection info: {e}")
-                
+            # Use the new initialize_search function
+            if initialize_search():
                 # Force refresh to update UI
                 st.rerun()
-                
-            except Exception as e:
-                st.error(f"Error initializing search: {str(e)}")
-                if st.session_state.show_debug:
-                    import traceback
-                    st.error(traceback.format_exc())
     
     # Active search UI
     else:
@@ -2231,7 +2672,7 @@ with tab2:
             search_text = st.text_input("Search Query", key="search_text", on_change=handle_search_submitted)
         
         with col2:
-            search_type = st.selectbox("Search Type", ["hybrid", "vector", "sparse", "keyword"])
+            search_type = st.selectbox("Search Type", ["hybrid", "vector", "sparse", "keyword"], key = "search_type_selection")
         
         # Search button - now we check both button click and if Enter was pressed
         search_clicked = st.button("Search")
@@ -2406,8 +2847,12 @@ with tab2:
                                         st.write("Copied to clipboard!")
                                         # Note: In Streamlit we can't directly access the clipboard,
                                         # but we can use JavaScript via components for this
+                                        
+                                        # Fix: Create the escaped text before the f-string
+                                        escaped_text = context_text.replace('`', '\\`')
+                                        
                                         st.markdown(f"""
-                                        <div class="copy-text" onclick="navigator.clipboard.writeText(`{context_text.replace('`', '\`')}`)">
+                                        <div class="copy-text" onclick="navigator.clipboard.writeText(`{escaped_text}`)">
                                             <span style="color: green">✓ Click here to copy</span>
                                         </div>
                                         """, unsafe_allow_html=True)
@@ -2463,7 +2908,7 @@ with tab3:
             
             # LLM provider settings
             if expandable_section("LLM Provider", "llm_settings_expanded", True, "🤖"):
-                llm_provider = st.radio("LLM Provider", ["Ollama", "MLX", "Transformers", "llama.cpp"])
+                llm_provider = st.radio("LLM Provider", ["Ollama", "MLX", "Transformers", "llama.cpp"], key="llm_provider_chat")
                 st.session_state.llm_provider = llm_provider
                 
                 # Different model options based on provider
@@ -2473,7 +2918,7 @@ with tab3:
                         response = requests.get("http://localhost:11434/api/tags")
                         if response.status_code == 200:
                             models = [model["name"] for model in response.json()["models"]]
-                            ollama_model = st.selectbox("Ollama Model", models) if models else st.text_input("Ollama Model", DEFAULT_OLLAMA_MODEL)
+                            ollama_model = st.selectbox("Ollama Model", models, key = "ollama_model_selection") if models else st.text_input("Ollama Model", DEFAULT_OLLAMA_MODEL)
                         else:
                             ollama_model = st.text_input("Ollama Model", DEFAULT_OLLAMA_MODEL)
                     except:
@@ -2513,7 +2958,7 @@ with tab3:
                                                     "always": "Always Search First",
                                                     "when_needed": "Search Only When Needed",
                                                     "ask_first": "Ask Before Searching"
-                                                }.get(x))
+                                                }.get(x), key ="auto_search_strategy_radio")
                     st.session_state.auto_search_strategy = auto_search_strategy
                     
                     max_auto_searches = st.slider("Max Auto Searches Per Question", 1, 5, 2,
@@ -2531,7 +2976,7 @@ with tab3:
                                               "top_results": "Top N Results",
                                               "most_relevant": "Most Relevant (Above Score Threshold)",
                                               "custom_selection": "Manually Select Results"
-                                          }.get(x))
+                                          }.get(x), key="context_strategy_radio")
                 st.session_state.context_strategy = context_strategy
                 
                 if context_strategy == "top_results":
@@ -2796,6 +3241,10 @@ with tab3:
                 # Import mlx_lm here to avoid loading on startup
                 from mlx_lm import load, generate, stream_generate
                 import mlx.core as mx
+
+                # Get any additional generation parameters from session state
+                top_p = st.session_state.get("top_p", 0.9)
+                repetition_penalty = st.session_state.get("repetition_penalty", 1.1)
                 
                 # Format the prompt based on likely system template
                 # This is tricky because different models use different templates
